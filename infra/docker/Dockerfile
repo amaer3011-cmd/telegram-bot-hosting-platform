@@ -31,6 +31,7 @@ FROM python:3.11-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -50,8 +51,11 @@ COPY --chown=appuser:appuser . .
 RUN mkdir -p /app/uploaded_bots /app/data /app/logs && \
     chown -R appuser:appuser /app/uploaded_bots /app/data /app/logs
 
-# Switch to non-root user
-USER appuser
+# Initialize attached volumes as root, then drop privileges in entrypoint
+COPY --chown=root:root infra/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+USER root
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1 \

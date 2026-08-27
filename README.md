@@ -52,7 +52,7 @@ python main.py
 
 ## النشر على Railway
 
-استخدم `infra/docker/Dockerfile` واترك أمر التشغيل الافتراضي في الصورة. أضف `HOST_BOT_TOKEN` و`ADMIN_IDS` كمتغيرات سرية، واربط Volume لمساري `/app/data` و`/app/uploaded_bots`. استخدم `/health` كمسار Healthcheck. لا تشغّل أكثر من نسخة واحدة من بوت التحكم بالتوكن نفسه.
+للنشر استخدم `infra/docker/Dockerfile` واترك **Start Command فارغًا** حتى يستخدم Railway `ENTRYPOINT` و`CMD` اللذين يهيئان الصلاحيات ويشغّلان التطبيق. أضف `HOST_BOT_TOKEN` و`ADMIN_IDS` كمتغيرات سرية من Railway Variables، وأضف **Volume واحدًا فقط** على `/app/data`؛ ستُحفظ داخله قاعدة البيانات وملفات البوتات عبر `DATABASE_PATH=/app/data/hosting.db` و`BOTS_DIR=/app/data/uploaded_bots`. استخدم `/health` كمسار Healthcheck مع مهلة 300 ثانية، ولا تشغّل أكثر من نسخة واحدة من بوت التحكم بالتوكن نفسه. راجع [`docs/RAILWAY_DEPLOYMENT.md`](docs/RAILWAY_DEPLOYMENT.md) للخطوات التفصيلية.
 
 ## حدود الأمان المهمة
 
@@ -69,8 +69,10 @@ python main.py
 | `database.py` | حفظ المستخدمين والبوتات ومتغيرات البيئة وسجل الاستخدام والتدقيق. |
 | `utils.py` | حماية ZIP، اكتشاف ملف التشغيل، فحص syntax، virtual environments، والسجلات. |
 | `config.py` | متغيرات البيئة وحدود المنصة. |
-| `infra/docker/Dockerfile` | صورة التشغيل. |
-| `infra/railway/railway.json` | إعداد Railway الأساسي. |
+| `infra/docker/Dockerfile` | صورة التشغيل مع entrypoint يهيئ Volume ثم يخفض الصلاحيات. |
+| `infra/docker/entrypoint.sh` | تهيئة `/app/data` وتشغيل التطبيق كمستخدم غير جذري. |
+| `railway.json` | إعداد Railway للبناء والـHealthcheck وسياسة إعادة التشغيل، ويُقرأ تلقائيًا من جذر المستودع. |
+| `docs/RAILWAY_DEPLOYMENT.md` | خطوات النشر وإعداد Variables وVolume وHealthcheck. |
 
 ## حالة المشروع
 
