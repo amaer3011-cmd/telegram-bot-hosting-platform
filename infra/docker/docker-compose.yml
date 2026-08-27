@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  bot-host:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    container_name: telegram-bot-host
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      PORT: "8080"
+      DATABASE_PATH: /app/data/hosting.db
+      BOTS_DIR: /app/uploaded_bots
+    volumes:
+      - bot_data:/app/data
+      - bot_uploads:/app/uploaded_bots
+      - bot_logs:/app/logs
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  bot_data:
+  bot_uploads:
+  bot_logs:

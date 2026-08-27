@@ -1,0 +1,66 @@
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / Packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Uploaded bot files (user data - should be on persistent volume)
+uploaded_bots/
+
+# Logs
+logs/
+*.log
+
+# Docker
+.docker/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Type checking
+.mypy_cache/
+*.pyi
+
+# Profiling
+*.prof
+
+# CI/CD
+.github/workflows/dependency-review.yml
+
+# OS
+Thumbs.db
