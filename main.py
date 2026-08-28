@@ -391,7 +391,15 @@ async def document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     pkgs_list += f" و{len(analysis_result.required_packages) - 8} أخرى"
                 analysis_report += f"\n📦 الحزم المكتشفة: <code>{pkgs_list}</code>"
             if analysis_result.env_vars:
-                analysis_report += f"\n🔐 متغيرات البيئة المطلوبة: <b>{len(analysis_result.env_vars)}</b>"
+                env_list = ", ".join(sorted(analysis_result.env_vars.keys())[:5])
+                if len(analysis_result.env_vars) > 5:
+                    env_list += f" و{len(analysis_result.env_vars) - 5} أخرى"
+                analysis_report += f"\n🔐 متغيرات البيئة المطلوبة: <b>{len(analysis_result.env_vars)}</b>\n<code>{env_list}</code>"
+                
+                # Check if BOT_TOKEN is required but not set
+                if "BOT_TOKEN" in analysis_result.env_vars:
+                    analysis_report += "\n\n⚠️ <b>مهم:</b> يبدو أن البوت يحتاج إلى <code>BOT_TOKEN</code>.\nلإضافته، اضغط على «⚙️ إعدادات البوت» ثم «➕ إضافة متغير» وأرسل:\n<code>BOT_TOKEN=123456:ABCxyz</code>"
+                    
             if analysis_result.recommendations:
                 analysis_report += f"\n💡 التوصيات: {len(analysis_result.recommendations)} توصيات"
             if analysis_result.security_warnings:
@@ -445,7 +453,11 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if action == "env_assignment":
         if "=" not in value:
-            await update.message.reply_text("⚠️ اكتب المتغير بهذا الشكل: KEY=VALUE")
+            await update.message.reply_text(
+                "⚠️ اكتب المتغير بهذا الشكل: <code>KEY=VALUE</code>\n\n"
+                "مثال للتوكن: <code>BOT_TOKEN=123456:ABCxyz</code>",
+                parse_mode=ParseMode.HTML
+            )
             return
         key, env_value = (part.strip() for part in value.split("=", 1))
         key = key.upper()
@@ -456,7 +468,18 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         db.set_env_var(row["bot_id"], key, env_value)
         db.log_admin_action(user_id, "set_env", row["bot_id"], f"key={key}")
         PENDING.pop(user_id, None)
-        await update.message.reply_text(f"✅ تم حفظ <code>{html.escape(key)}</code>. أعد تشغيل البوت لتطبيقه.", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id)))
+        
+        # Special message for BOT_TOKEN
+        if key == "BOT_TOKEN":
+            await update.message.reply_text(
+                f"✅ تم حفظ <code>{html.escape(key)}</code> بنجاح!\n\n"
+                "🎯 الآن يمكنك تشغيل البوت بالضغط على زر «تشغيل».\n"
+                "إذا لم يعمل، تأكد من أن التوكن صحيح وأن البوت لديه صلاحيات كافية.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id))
+            )
+        else:
+            await update.message.reply_text(f"✅ تم حفظ <code>{html.escape(key)}</code>. أعد تشغيل البوت لتطبيقه.", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id)))
         return
     if action == "memory_assignment":
         row = owned_bot(int(pending["bot_id"]), user_id)
@@ -931,7 +954,14 @@ async def bot_callback(query, data: str) -> None:
         return
     elif action == "env_add":
         PENDING[query.from_user.id] = {"action": "env_assignment", "bot_id": bot_id}
-        await query.message.reply_text("🔐 أرسل المتغير بهذا الشكل: <code>BOT_TOKEN=123456:ABC</code>", parse_mode=ParseMode.HTML)
+        await query.message.reply_text(
+            "🔐 <b>إضافة متغير بيئة للبوت</b>\n\n"
+            "أرسل المتغير بهذا الشكل:\n"
+            "<code>BOT_TOKEN=123456:ABCxyz</code>\n\n"
+            "حيث <code>123456:ABCxyz</code> هو توكن البوت الذي حصلت عليه من @BotFather.\n"
+            "يمكنك إضافة أي متغيرات أخرى يحتاجها البوت بنفس الطريقة.",
+            parse_mode=ParseMode.HTML
+        )
         return
     elif action == "memory":
         PENDING[query.from_user.id] = {"action": "memory_assignment", "bot_id": bot_id}
