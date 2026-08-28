@@ -29,6 +29,7 @@ import shutil
 import backup
 from env_crypto import encrypt_value, decrypt_value
 from process_manager import ProcessManager
+from ai_analyzer import analyze_bot, AnalysisResult
 from utils import (
     check_syntax,
     delete_folder,
@@ -347,22 +348,64 @@ async def document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await telegram_file.download_to_drive(archive_path)
         await edit_progress(progress, "تجهيز البوت", 35, "تم تنزيل الملف، جارٍ فحص الأرشيف...")
         await asyncio.to_thread(extract_zip, archive_path, temp_folder)
-        await edit_progress(progress, "تجهيز البوت", 60, "تم فك الأرشيف بأمان، جارٍ العثور على ملف التشغيل...")
+        await edit_progress(progress, "تجهيز البوت", 60, "تم فك الأرشيف بأمان، جارٍ تحليل البوت بالذكاء الاصطناعي...")
+        
+        # AI-powered bot analysis
+        analysis_result = await asyncio.to_thread(analyze_bot, temp_folder)
+        
+        await edit_progress(progress, "تجهيز البوت", 70, "تم التحليل، جارٍ العثور على ملف التشغيل...")
         entry = await asyncio.to_thread(find_entry_file, temp_folder)
         if not entry:
             raise ValueError("لم أجد ملف Python للتشغيل. استخدم main.py أو bot.py أو app.py.")
         valid, error = await asyncio.to_thread(check_syntax, entry)
         if not valid:
             raise ValueError(f"خطأ في صياغة ملف التشغيل: {error}")
-        await edit_progress(progress, "تجهيز البوت", 80, "تم التحقق من ملف التشغيل، جارٍ حفظ البوت...")
+        
+        await edit_progress(progress, "تجهيز البوت", 85, "تم التحقق من ملف التشغيل، جارٍ حفظ البوت...")
         folder = await asyncio.to_thread(finalize_bot_folder, temp_folder, user_id, bot_id)
         db.set_bot_files(bot_id, folder, entry.replace(temp_folder, folder, 1))
         db.log_admin_action(user_id, "upload_bot", bot_id, f"entry={os.path.basename(entry)}")
+        
+        # Save detected environment variables
+        if analysis_result.success and analysis_result.env_vars:
+            for env_key in analysis_result.env_vars.keys():
+                if env_key not in config.PROTECTED_ENV_KEYS:
+                    db.set_env_var(bot_id, env_key, "")
+        
+        # Apply suggested memory limit if different from default
+        if analysis_result.success and analysis_result.suggested_memory_mb:
+            if analysis_result.suggested_memory_mb != config.MAX_BOT_MEMORY_MB:
+                db.set_max_memory(bot_id, min(analysis_result.suggested_memory_mb, config.MAX_BOT_MEMORY_MB))
+        
         PENDING.pop(user_id, None)
         row = db.get_bot(bot_id)
+        
+        # Build analysis report message
+        analysis_report = ""
+        if analysis_result.success:
+            if analysis_result.bot_type != "unknown":
+                analysis_report += f"\n🤖 نوع البوت: <b>{analysis_result.bot_type}</b>"
+            if analysis_result.required_packages:
+                pkgs_list = ", ".join(sorted(analysis_result.required_packages)[:8])
+                if len(analysis_result.required_packages) > 8:
+                    pkgs_list += f" و{len(analysis_result.required_packages) - 8} أخرى"
+                analysis_report += f"\n📦 الحزم المكتشفة: <code>{pkgs_list}</code>"
+            if analysis_result.env_vars:
+                analysis_report += f"\n🔐 متغيرات البيئة المطلوبة: <b>{len(analysis_result.env_vars)}</b>"
+            if analysis_result.recommendations:
+                analysis_report += f"\n💡 التوصيات: {len(analysis_result.recommendations)} توصيات"
+            if analysis_result.security_warnings:
+                analysis_report += f"\n⚠️ تحذيرات أمنية: {len(analysis_result.security_warnings)}"
+        else:
+            analysis_report += f"\n⚠️ فشل التحليل: {html.escape(str(analysis_result.error_message)[:200])}"
+        
         await edit_progress(progress, "تجهيز البوت", 100, "تم قبول البوت وتجهيزه.", reply_markup=bot_keyboard(bot_id))
         await update.message.reply_text(
-            "✅ <b>تم قبول البوت وتجهيزه</b>\n\n" + bot_summary(row) + "\n\nاضغط تشغيل عندما تكون جاهزًا.",
+            f"✅ <b>تم قبول البوت وتجهيزه</b>\n\n" + 
+            bot_summary(row) + 
+            analysis_report +
+            "\n\nاضغط تشغيل عندما تكون جاهزًا.\n" +
+            ("💡 <i>تم تحليل البوت تلقائيًا واكتشاف متطلباته. راجع متغيرات البيئة المطلوبة قبل التشغيل.</i>" if analysis_result.success else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=bot_keyboard(bot_id),
         )
