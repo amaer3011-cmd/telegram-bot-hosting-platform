@@ -1,14 +1,51 @@
-__pycache__/
-*.py[cod]
-.venv/
+```
+# Dependencies
 venv/
-.env
-*.sqlite3
-*.sqlite3-*
-*.db
-hosting.db
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist-packages/
+
+# Build artifacts
+build/
+dist/
+*.egg
+*.whl
+*.so
+*.dylib
+*.dll
+
+# Logs
 *.log
+*.out
+*.pid
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
-.pytest_cache/
-.ruff_cache/
-data/
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Coverage
+.coverage
+htmlcov/
+coverage/
+```

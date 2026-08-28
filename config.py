@@ -44,5 +44,31 @@ RATE_LIMIT_MSGS_PER_MINUTE = int(os.getenv("RATE_LIMIT_MSGS_PER_MINUTE", "10"))
 # Encryption
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 
+# Docker settings
+USE_DOCKER = os.getenv("USE_DOCKER", "false").lower() in ("true", "1", "yes")
+DOCKER_SOCKET = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
+
+# Web Dashboard settings
+DASHBOARD_ENABLED = os.getenv("DASHBOARD_ENABLED", "true").lower() in ("true", "1", "yes")
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+
+# PostgreSQL/Redis settings (optional - for production scaling)
+USE_POSTGRESQL = os.getenv("USE_POSTGRESQL", "false").lower() in ("true", "1", "yes")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "bot_hosting")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+
+USE_REDIS = os.getenv("USE_REDIS", "false").lower() in ("true", "1", "yes")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
+# AI Analysis settings
+AI_ANALYSIS_ENABLED = os.getenv("AI_ANALYSIS_ENABLED", "true").lower() in ("true", "1", "yes")
+AI_MAX_FILE_SIZE_KB = int(os.getenv("AI_MAX_FILE_SIZE_KB", "512"))  # الحد الأقصى لحجم الملف للتحليل
+
 BOTS_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)

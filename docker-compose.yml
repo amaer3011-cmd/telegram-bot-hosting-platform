@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # Main bot hosting service
+  bot-hosting:
+    build: .
+    container_name: telegram-bot-hosting
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+      - "${DASHBOARD_PORT:-8000}:${DASHBOARD_PORT:-8000}"
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-in-Docker isolation
+    environment:
+      - HOST_BOT_TOKEN=${HOST_BOT_TOKEN}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - USE_DOCKER=${USE_DOCKER:-false}
+      - DASHBOARD_ENABLED=${DASHBOARD_ENABLED:-true}
+      - DASHBOARD_PORT=${DASHBOARD_PORT:-8000}
+    depends_on:
+      - redis
+    networks:
+      - bot-network
+
+  # Redis for caching and rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: bot-hosting-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - bot-network
+    profiles:
+      - with-redis
+
+  # PostgreSQL for production database (optional)
+  postgres:
+    image: postgres:16-alpine
+    container_name: bot-hosting-postgres
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-bot_hosting}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    networks:
+      - bot-network
+    profiles:
+      - with-postgres
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+  postgres-data:

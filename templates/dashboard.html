@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - لوحة تحكم استضافة البوتات</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --success: #16a34a;
+            --danger: #dc2626;
+            --warning: #ca8a04;
+            --bg: #f8fafc;
+            --card: #ffffff;
+            --text: #1e293b;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        header {
+            background: var(--primary);
+            color: white;
+            padding: 20px 0;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        header h1 {
+            text-align: center;
+            font-size: 2rem;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: var(--card);
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+            text-align: center;
+            transition: transform 0.2s;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .stat-card h3 {
+            color: #64748b;
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+        }
+        
+        .stat-card .value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: var(--primary);
+        }
+        
+        .stat-card.success .value { color: var(--success); }
+        .stat-card.danger .value { color: var(--danger); }
+        .stat-card.warning .value { color: var(--warning); }
+        
+        .section {
+            background: var(--card);
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+            margin-bottom: 30px;
+        }
+        
+        .section h2 {
+            margin-bottom: 20px;
+            color: var(--primary);
+            border-bottom: 2px solid var(--primary);
+            padding-bottom: 10px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: right;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        th {
+            background: #f1f5f9;
+            font-weight: 600;
+        }
+        
+        tr:hover {
+            background: #f8fafc;
+        }
+        
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+        
+        .status-running { background: #dcfce7; color: #166534; }
+        .status-stopped { background: #fee2e2; color: #991b1b; }
+        .status-crashed { background: #fef3c7; color: #92400e; }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            margin: 2px;
+        }
+        
+        .btn-primary { background: var(--primary); color: white; }
+        .btn-primary:hover { background: #1d4ed8; }
+        
+        .btn-success { background: var(--success); color: white; }
+        .btn-success:hover { background: #15803d; }
+        
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-danger:hover { background: #b91c1c; }
+        
+        .btn-warning { background: var(--warning); color: white; }
+        .btn-warning:hover { background: #a16207; }
+        
+        .logs-container {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            direction: ltr;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #64748b;
+        }
+        
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        
+        .alert-info {
+            background: #dbeafe;
+            color: #1e40af;
+            border: 1px solid #bfdbfe;
+        }
+        
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            table {
+                font-size: 0.85rem;
+            }
+            
+            .btn {
+                padding: 6px 10px;
+                font-size: 0.8rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>🤖 لوحة تحكم استضافة البوتات</h1>
+        </div>
+    </header>
+    
+    <div class="container">
+        {% if docker_available %}
+        <div class="alert alert-info">
+            ✅ Docker متاح - البوتات تعمل في حاويات معزولة
+        </div>
+        {% else %}
+        <div class="alert alert-info">
+            ⚠️ Docker غير متاح - البوتات تعمل مباشرة على النظام
+        </div>
+        {% endif %}
+        
+        <div class="stats-grid" id="statsGrid">
+            <div class="loading">جاري تحميل الإحصائيات...</div>
+        </div>
+        
+        <div class="section">
+            <h2>📊 البوتات النشطة</h2>
+            <div id="botsTable">
+                <div class="loading">جاري تحميل البوتات...</div>
+            </div>
+        </div>
+        
+        <div class="section" id="logsSection" style="display: none;">
+            <h2>📜 سجلات البوت <span id="logBotId"></span></h2>
+            <button class="btn btn-primary" onclick="closeLogs()">🔙 إغلاق</button>
+            <div class="logs-container" id="logsContent"></div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = '/api';
+        
+        // تحميل الإحصائيات
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_BASE}/stats`, {
+                    credentials: 'include'
+                });
+                
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        showLogin();
+                        return;
+                    }
+                    throw new Error('فشل تحميل الإحصائيات');
+                }
+                
+                const stats = await response.json();
+                
+                document.getElementById('statsGrid').innerHTML = `
+                    <div class="stat-card">
+                        <h3>إجمالي المستخدمين</h3>
+                        <div class="value">${stats.total_users}</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>إجمالي البوتات</h3>
+                        <div class="value">${stats.total_bots}</div>
+                    </div>
+                    <div class="stat-card success">
+                        <h3>بوتات نشطة</h3>
+                        <div class="value">${stats.running_bots}</div>
+                    </div>
+                    <div class="stat-card danger">
+                        <h3>بوتات متوقفة</h3>
+                        <div class="value">${stats.stopped_bots}</div>
+                    </div>
+                    <div class="stat-card warning">
+                        <h3>بوتات معطلة</h3>
+                        <div class="value">${stats.crashed_bots}</div>
+                    </div>
+                `;
+            } catch (error) {
+                console.error('Error loading stats:', error);
+            }
+        }
+        
+        // تحميل قائمة البوتات
+        async function loadBots() {
+            try {
+                const response = await fetch(`${API_BASE}/bots`, {
+                    credentials: 'include'
+                });
+                
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        showLogin();
+                        return;
+                    }
+                    throw new Error('فشل تحميل البوتات');
+                }
+                
+                const data = await response.json();
+                renderBotsTable(data.bots);
+            } catch (error) {
+                console.error('Error loading bots:', error);
+                document.getElementById('botsTable').innerHTML = 
+                    '<div class="alert alert-info">فشل تحميل البوتات. تأكد من تسجيل الدخول.</div>';
+            }
+        }
+        
+        function renderBotsTable(bots) {
+            if (bots.length === 0) {
+                document.getElementById('botsTable').innerHTML = 
+                    '<div class="alert alert-info">لا توجد بوتات مسجلة</div>';
+                return;
+            }
+            
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>المعرف</th>
+                            <th>الاسم</th>
+                            <th>المالك</th>
+                            <th>الحالة</th>
+                            <th>الإجراءات</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            
+            bots.forEach(bot => {
+                const statusClass = `status-${bot.status}`;
+                const statusText = {
+                    'running': '🟢 نشط',
+                    'stopped': '🔴 متوقف',
+                    'crashed': '🟡 معطل'
+                }[bot.status] || bot.status;
+                
+                html += `
+                    <tr>
+                        <td>${bot.bot_id}</td>
+                        <td>${escapeHtml(bot.name)}</td>
+                        <td>@${escapeHtml(bot.owner_username || 'غير معروف')}</td>
+                        <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                        <td>
+                            ${bot.status !== 'running' ? 
+                                `<button class="btn btn-success" onclick="startBot(${bot.bot_id})">▶️</button>` : 
+                                ''}
+                            ${bot.status === 'running' ? 
+                                `<button class="btn btn-danger" onclick="stopBot(${bot.bot_id})">⏹️</button>` : 
+                                ''}
+                            <button class="btn btn-warning" onclick="restartBot(${bot.bot_id})">🔁</button>
+                            <button class="btn btn-primary" onclick="showLogs(${bot.bot_id})">📜</button>
+                        </td>
+                    </tr>
+                `;
+            });
+            
+            html += '</tbody></table>';
+            document.getElementById('botsTable').innerHTML = html;
+        }
+        
+        // بدء بوت
+        async function startBot(botId) {
+            if (!confirm(`هل تريد تشغيل البوت ${botId}؟`)) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/bot/${botId}/start`, {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                
+                const result = await response.json();
+                alert(result.message);
+                loadBots();
+            } catch (error) {
+                alert('فشل تشغيل البوت: ' + error.message);
+            }
+        }
+        
+        // إيقاف بوت
+        async function stopBot(botId) {
+            if (!confirm(`هل تريد إيقاف البوت ${botId}؟`)) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/bot/${botId}/stop`, {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                
+                const result = await response.json();
+                alert(result.message);
+                loadBots();
+            } catch (error) {
+                alert('فشل إيقاف البوت: ' + error.message);
+            }
+        }
+        
+        // إعادة تشغيل بوت
+        async function restartBot(botId) {
+            if (!confirm(`هل تريد إعادة تشغيل البوت ${botId}؟`)) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/bot/${botId}/restart`, {
+                    method: 'POST',
+                    credentials: 'include'
+                });
+                
+                const result = await response.json();
+                alert(result.message);
+                loadBots();
+            } catch (error) {
+                alert('فشل إعادة تشغيل البوت: ' + error.message);
+            }
+        }
+        
+        // عرض السجلات
+        async function showLogs(botId) {
+            document.getElementById('logsSection').style.display = 'block';
+            document.getElementById('logBotId').textContent = botId;
+            document.getElementById('logsContent').textContent = 'جاري تحميل السجلات...';
+            
+            try {
+                const response = await fetch(`${API_BASE}/bot/${botId}/logs?lines=100`, {
+                    credentials: 'include'
+                });
+                
+                const data = await response.json();
+                document.getElementById('logsContent').textContent = data.logs;
+            } catch (error) {
+                document.getElementById('logsContent').textContent = 'فشل تحميل السجلات: ' + error.message;
+            }
+        }
+        
+        function closeLogs() {
+            document.getElementById('logsSection').style.display = 'none';
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function showLogin() {
+            // المتصفح سيظهر نافذة المصادقة تلقائيًا
+            window.location.reload();
+        }
+        
+        // التحميل الأولي
+        document.addEventListener('DOMContentLoaded', () => {
+            loadStats();
+            loadBots();
+            
+            // تحديث تلقائي كل 30 ثانية
+            setInterval(loadStats, 30000);
+            setInterval(loadBots, 30000);
+        });
+    </script>
+</body>
+</html>
