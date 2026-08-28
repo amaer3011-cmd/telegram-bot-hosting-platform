@@ -3,6 +3,7 @@ import threading
 import time
 
 from config import DB_PATH, DEFAULT_MAX_BOTS
+import env_crypto
 
 _lock = threading.Lock()
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -320,26 +321,48 @@ def set_max_memory(bot_id, value_mb):
 # ================= متغيرات البيئة =================
 
 def set_env_var(bot_id, key, value):
+    """مُفسَّر: يشفَّر القيمة الحساسة قبل تخزينها في قاعدة البيانات."""
+    encrypted = env_crypto.encrypt_value(value) if value else value
     with _lock:
         _conn.execute(
             "INSERT INTO env_vars (bot_id, key, value) VALUES (?,?,?) "
             "ON CONFLICT(bot_id, key) DO UPDATE SET value=excluded.value",
-            (bot_id, key, value),
+            (bot_id, key, encrypted),
         )
         _conn.commit()
 
 
 def get_env_vars(bot_id):
-    """يرجع dict بسيط {KEY: VALUE} لحقنها كمتغيرات بيئة عند التشغيل"""
+    """يرجع dict بسيط {KEY: VALUE} لحقنها كمتغيرات بيئة عند التشغيل
+
+    تُفكَّر القيم من قاعدة البيانات قبل إرجاعها عند الحاجة.
+    """
     with _lock:
         cur = _conn.execute("SELECT key, value FROM env_vars WHERE bot_id=?", (bot_id,))
-        return {r["key"]: r["value"] for r in cur.fetchall()}
+        result = {}
+        for r in cur.fetchall():
+            raw = r["value"]
+            # Only decrypt if the value looks encrypted; leave empty/short values as-is
+            if env_crypto.is_encrypted(raw):
+                try:
+                    result[r["key"]] = env_crypto.decrypt_value(raw)
+                except Exception:
+                    # Corrupted value — fall back to raw so the bot can still start
+                    # (the admin can re-set the variable)
+                    result[r["key"]] = raw
+            else:
+                result[r["key"]] = raw
+        return result
 
 
 def list_env_vars(bot_id):
+    """قائمة متغيرات البيئة — تعرض الأسماء فقط، والقيم تظهر مصطلح مشفر."""
     with _lock:
-        cur = _conn.execute("SELECT * FROM env_vars WHERE bot_id=?", (bot_id,))
-        return cur.fetchall()
+        cur = _conn.execute(
+            "SELECT id, key, CASE WHEN value = '' OR value IS NULL OR length(value) < 32 THEN value ELSE '🔒 مشفر' END AS display_value FROM env_vars WHERE bot_id=?",
+            (bot_id,),
+        )
+        return [{"id": r["id"], "key": r["key"], "display_value": r["display_value"]} for r in cur.fetchall()]
 
 
 def delete_env_var(env_id):
@@ -412,6 +435,53 @@ def get_audit_log(limit=20):
     with _lock:
         cur = _conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))
         return cur.fetchall()
+
+
+def get_audit_log_page(page: int, per_page: int = 50):
+    """Return audit log entries for a specific page (1-indexed)."""
+    with _lock:
+        offset = (page - 1) * per_page
+        cur = _conn.execute(
+            "SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?",
+            (per_page, offset),
+        )
+        rows = cur.fetchall()
+        total = _conn.execute("SELECT COUNT(*) AS c FROM audit_log").fetchone()["c"]
+        return rows, total
+
+
+def get_users_page(page: int, per_page: int = 50):
+    """Return users for a specific page (1-indexed)."""
+    with _lock:
+        offset = (page - 1) * per_page
+        cur = _conn.execute(
+            "SELECT * FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+            (per_page, offset),
+        )
+        rows = cur.fetchall()
+        total = _conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        return rows, total
+
+
+def get_bots_page(admin: bool, owner_id: int | None, page: int, per_page: int = 50):
+    """Return bots for a specific page. Admin sees all; users see their own."""
+    with _lock:
+        offset = (page - 1) * per_page
+        if admin:
+            cur = _conn.execute(
+                "SELECT * FROM bots ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (per_page, offset),
+            )
+            total = _conn.execute("SELECT COUNT(*) AS c FROM bots").fetchone()["c"]
+        else:
+            cur = _conn.execute(
+                "SELECT * FROM bots WHERE owner_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (owner_id, per_page, offset),
+            )
+            total = _conn.execute(
+                "SELECT COUNT(*) AS c FROM bots WHERE owner_id=?", (owner_id,)
+            ).fetchone()["c"]
+        return cur.fetchall(), total
 
 
 # ================= إحصائيات عامة =================

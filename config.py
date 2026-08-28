@@ -38,5 +38,11 @@ PROTECTED_ENV_KEYS = {
     "PYTHONSTARTUP",
 }
 
+# Rate limiting: max messages per user per minute (0 = disabled)
+RATE_LIMIT_MSGS_PER_MINUTE = int(os.getenv("RATE_LIMIT_MSGS_PER_MINUTE", "10"))
+
+# Encryption
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
+
 BOTS_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)

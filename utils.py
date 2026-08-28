@@ -253,10 +253,14 @@ def human_uptime(seconds: float) -> str:
     return f"{s} ث"
 
 
-def rotate_log_if_needed(log_path: str, max_size_mb: int):
+def rotate_log_if_needed(log_path: str, max_size_mb: int, archive: bool = True):
     """إن تجاوز حجم ملف السجل الحد الأقصى، يقتطعه ويحتفظ بآخر نصف الحجم المسموح
     فقط (بدل حذفه بالكامل أو تركه ينمو بلا حدود)، حتى لا يفقد المستخدم كل
-    تاريخ سجله دفعة واحدة عند كل تجاوز."""
+    تاريخ سجله دفعة واحدة عند كل تجاوز.
+
+    إذا كان archive=True، يتم حفظ الجزء المقطوع في ملف أرشيف منفصل
+    (run.log.1, run.log.2, إلخ) قبل القطع.
+    """
     try:
         if not os.path.exists(log_path):
             return
@@ -264,6 +268,11 @@ def rotate_log_if_needed(log_path: str, max_size_mb: int):
         size = os.path.getsize(log_path)
         if size <= max_bytes:
             return
+
+        # Archive the current log before truncating
+        if archive:
+            _archive_log_part(log_path, size, max_bytes)
+
         keep_bytes = max(max_bytes // 2, 1024)
         with open(log_path, "rb") as f:
             if size > keep_bytes:
@@ -277,6 +286,43 @@ def rotate_log_if_needed(log_path: str, max_size_mb: int):
             f.write(tail_data)
     except Exception:
         # لا نُفشل تشغيل البوت بسبب مشكلة في تدوير السجل
+        pass
+
+
+def _archive_log_part(log_path: str, current_size: int, max_bytes: int) -> None:
+    """Archive the part of the log that will be truncated.
+
+    Creates numbered archive files: run.log.1, run.log.2, etc.
+    Keeps up to MAX_LOG_ARCHIVES archives.
+    """
+    try:
+        log_dir = os.path.dirname(log_path)
+        base_name = os.path.basename(log_path)
+
+        # Find existing archives and rotate them
+        MAX_LOG_ARCHIVES = int(os.getenv("MAX_LOG_ARCHIVES", "5"))
+
+        # Shift existing archives: .5 -> .6, .4 -> .5, etc.
+        for i in range(MAX_LOG_ARCHIVES, 0, -1):
+            src = os.path.join(log_dir, f"{base_name}.{i}")
+            if os.path.exists(src):
+                if i == MAX_LOG_ARCHIVES:
+                    # Delete the oldest
+                    os.remove(src)
+                else:
+                    dst = os.path.join(log_dir, f"{base_name}.{i+1}")
+                    os.rename(src, dst)
+
+        # Save the truncated part as .1
+        archive_path = os.path.join(log_dir, f"{base_name}.1")
+        with open(log_path, "rb") as f:
+            # Read the part that will be truncated (the older part)
+            f.seek(0)
+            truncated_part = f.read(current_size - max(max_bytes // 2, 1024))
+        with open(archive_path, "wb") as f:
+            f.write(truncated_part)
+    except Exception:
+        # Silent fail - don't interrupt bot operation
         pass
 
 

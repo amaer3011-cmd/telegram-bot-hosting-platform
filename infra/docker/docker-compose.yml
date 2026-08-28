@@ -13,6 +13,8 @@ services:
       PORT: "8080"
       DATABASE_PATH: /app/data/hosting.db
       BOTS_DIR: /app/data/uploaded_bots
+      ENCRYPTION_KEY: ""
+      RATE_LIMIT_MSGS_PER_MINUTE: "10"
     volumes:
       - bot_data:/app/data
     ports:

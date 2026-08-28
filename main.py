@@ -25,10 +25,14 @@ from telegram.ext import (
 
 import config
 import database as db
+import shutil
+import backup
+from env_crypto import encrypt_value, decrypt_value
 from process_manager import ProcessManager
 from utils import (
     check_syntax,
     delete_folder,
+    export_bot_zip,
     extract_zip,
     finalize_bot_folder,
     find_entry_file,
@@ -96,7 +100,8 @@ def bot_keyboard(bot_id: int, admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📈 الموارد", callback_data=f"bot:usage:{bot_id}"), InlineKeyboardButton("🔐 البيئة", callback_data=f"bot:env:{bot_id}")],
         [InlineKeyboardButton("🧠 الذاكرة", callback_data=f"bot:memory:{bot_id}"), InlineKeyboardButton("♻️ إعادة تلقائية", callback_data=f"bot:auto:{bot_id}")],
         [InlineKeyboardButton("⏰ جدولة", callback_data=f"bot:schedule:{bot_id}")],
-        [InlineKeyboardButton("🗑 حذف", callback_data=f"bot:delete_confirm:{bot_id}")],
+        [InlineKeyboardButton("📦 تصدير", callback_data=f"bot:export:{bot_id}"), InlineKeyboardButton("📋 نسخ", callback_data=f"bot:clone:{bot_id}")],
+        [InlineKeyboardButton("🔄 تحديث", callback_data=f"bot:update:{bot_id}"), InlineKeyboardButton("🗑 حذف", callback_data=f"bot:delete_confirm:{bot_id}")],
         [InlineKeyboardButton("🔙 بوتاتي" if not admin else "🔙 لوحة الإدارة", callback_data="my_bots" if not admin else "admin:back")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -221,18 +226,26 @@ async def my_bots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_bots(update.message, update.effective_user.id, admin=False)
 
 
-async def send_bots(message, owner_id: int, admin: bool) -> None:
-    rows = db.get_all_bots() if admin else db.get_user_bots(owner_id)
-    if not rows:
+async def send_bots(message, owner_id: int, admin: bool, page: int = 1) -> None:
+    page = max(1, int(page))
+    rows, total = db.get_bots_page(admin, None if admin else owner_id, page, 20)
+    if not rows and page == 1:
         await message.reply_text("🤖 لا توجد بوتات مضافة بعد. ابدأ بإضافة أول بوت لك.", reply_markup=main_keyboard())
         return
-    lines = ["🤖 <b>البوتات المتاحة</b>", ""]
+    lines = [f"🤖 <b>البوتات المتاحة</b> — صفحة {page}/{max(1, (total + 19) // 20)}", ""]
     buttons = []
-    for row in rows[:50]:
+    for row in rows:
         owner = f" — المالك <code>{row['owner_id']}</code>" if admin else ""
         name = row["name"] or f"Bot {row['bot_id']}"
         lines.append(f"• <b>{html.escape(name)}</b> — {status_label(row['status'], manager().is_running(row['bot_id']))}{owner}")
         buttons.append([InlineKeyboardButton(f"⚙️ {name}", callback_data=f"bot:view:{row['bot_id']}")])
+    navigation = []
+    if page > 1:
+        navigation.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"bots:{'admin' if admin else 'user'}:{page - 1}"))
+    if page * 20 < total:
+        navigation.append(InlineKeyboardButton("التالي ➡️", callback_data=f"bots:{'admin' if admin else 'user'}:{page + 1}"))
+    if navigation:
+        buttons.append(navigation)
     buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin:back" if admin else "menu")])
     await message.reply_text("\n".join(lines)[:3900], parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -475,6 +488,61 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
         return
+    if action == "update_archive":
+        # Handle ZIP upload for bot update
+        pending = PENDING.get(user_id, {})
+        bot_id = int(pending.get("bot_id", 0))
+        row = db.get_bot(bot_id)
+        if not row or row["owner_id"] != user_id and not is_admin(user_id):
+            PENDING.pop(user_id, None)
+            await update.message.reply_text("🚫 لا يمكنك تحديث هذا البوت.", reply_markup=main_keyboard())
+            return
+        document_obj = update.message.document
+        if not document_obj or not (document_obj.file_name or "").lower().endswith(".zip"):
+            await update.message.reply_text("⚠️ أرسل ملف ZIP صالح.")
+            return
+        if document_obj.file_size and document_obj.file_size > config.MAX_FILE_SIZE_MB * 1024 * 1024:
+            await update.message.reply_text(f"⚠️ حجم الملف أكبر من الحد المسموح ({config.MAX_FILE_SIZE_MB}MB).")
+            return
+        temp_folder = make_temp_upload_folder(user_id, f"update_{bot_id}")
+        archive_path = os.path.join(temp_folder, "upload.zip")
+        progress = await update.message.reply_text(progress_text("تحديث البوت", 10, "جارٍ تنزيل الملف..."), parse_mode=ParseMode.HTML)
+        try:
+            telegram_file = await document_obj.get_file()
+            await telegram_file.download_to_drive(archive_path)
+            await edit_progress(progress, "تحديث البوت", 35, "تم تنزيل الملف، جارٍ فحص الأرشيف...")
+            await asyncio.to_thread(extract_zip, archive_path, temp_folder)
+            await edit_progress(progress, "تحديث البوت", 60, "تم فك الأرشيف، جارٍ البحث عن ملف التشغيل...")
+            entry = await asyncio.to_thread(find_entry_file, temp_folder)
+            if not entry:
+                raise ValueError("لم أجد ملف Python للتشغيل. استخدم main.py أو bot.py أو app.py.")
+            valid, error = await asyncio.to_thread(check_syntax, entry)
+            if not valid:
+                raise ValueError(f"خطأ في صياغة ملف التشغيل: {error}")
+            await edit_progress(progress, "تحديث البوت", 80, "تم التحقق، جارٍ استبدال الملفات...")
+            old_folder = row["folder"]
+            if os.path.exists(old_folder):
+                shutil.rmtree(old_folder, ignore_errors=True)
+            new_folder = await asyncio.to_thread(finalize_bot_folder, temp_folder, user_id, bot_id)
+            entry_final = entry.replace(temp_folder, new_folder, 1)
+            db.set_bot_files(bot_id, new_folder, entry_final)
+            db.log_admin_action(user_id, "update_bot", bot_id, f"entry={os.path.basename(entry_final)}")
+            PENDING.pop(user_id, None)
+            updated_row = db.get_bot(bot_id)
+            await edit_progress(progress, "تحديث البوت", 100, "تم تحديث البوت بنجاح!", reply_markup=bot_keyboard(bot_id, is_admin(user_id)))
+            await update.message.reply_text(
+                "✅ <b>تم تحديث البوت بنجاح</b>\n\n"
+                + bot_summary(updated_row)
+                + "\n\nاضغط تشغيل لتشغيل النسخة المحدثة.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bot_keyboard(bot_id, is_admin(user_id)),
+            )
+        except Exception as exc:
+            logger.exception("Update failed for bot %s", bot_id)
+            delete_folder(temp_folder)
+            PENDING.pop(user_id, None)
+            await edit_progress(progress, "تحديث البوت", 100, f"فشل التحديث: {str(exc)[:160]}", reply_markup=bot_keyboard(bot_id, is_admin(user_id)))
+            await update.message.reply_text(f"❌ لم أستطع تحديث البوت. السبب: <code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(user_id)))
     await update.message.reply_text("استخدم الأزرار أو أرسل /help لمعرفة الخطوات.", reply_markup=main_keyboard())
 
 
@@ -617,6 +685,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith("admin:"):
         await admin_callback(query, data)
         return
+    if data.startswith("bots:"):
+        parts = data.split(":")
+        if len(parts) == 3 and parts[1] in {"admin", "user"}:
+            try:
+                page = max(1, int(parts[2]))
+            except ValueError:
+                page = 1
+            is_admin_page = parts[1] == "admin"
+            if is_admin_page and not is_admin(query.from_user.id):
+                return
+            await send_bots(query.message, query.from_user.id, admin=is_admin_page, page=page)
+        return
     if data.startswith("bot:"):
         await bot_callback(query, data)
 
@@ -634,17 +714,43 @@ async def admin_callback(query, data: str) -> None:
             reply_markup=admin_keyboard(),
         )
     elif action == "users":
-        rows = db.get_all_users()
+        page = 1
+        if data.startswith("admin:users_page:"):
+            try:
+                page = int(data.split(":")[-1])
+            except (ValueError, IndexError):
+                page = 1
+        rows, total = db.get_users_page(page, 50)
         if not rows:
             text_value = "👥 لا يوجد مستخدمون بعد."
         else:
             lines = ["👥 <b>المستخدمون</b>", ""]
-            for row in rows[:50]:
-                lines.append(f"• <code>{row['user_id']}</code> — @{html.escape(row['username'] or 'بدون_username')} — {'🚫 محظور' if row['is_banned'] else '✅ نشط'} — بوتات: {db.count_user_bots(row['user_id'])}")
+            for row in rows:
+                lines.append(
+                    f"• <code>{row['user_id']}</code> — @{html.escape(row['username'] or 'بدون_username')} — "
+                    f"{'🚫 محظور' if row['is_banned'] else '✅ نشط'} — بوتات: {db.count_user_bots(row['user_id'])}"
+                )
             text_value = "\n".join(lines)
-        await query.message.reply_text(text_value[:3900], parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+        if total > 50:
+            total_pages = (total + 49) // 50
+            nav = []
+            if page > 1:
+                nav.append(InlineKeyboardButton("◀️ السابقة", callback_data=f"admin:users_page:{page-1}"))
+            nav.append(InlineKeyboardButton(f"الصفحة {page} من {total_pages}", callback_data="admin:users"))
+            if page < total_pages:
+                nav.append(InlineKeyboardButton("التالية ▶️", callback_data=f"admin:users_page:{page+1}"))
+            keyboard = InlineKeyboardMarkup([nav])
+        else:
+            keyboard = admin_keyboard()
+        await query.message.reply_text(text_value[:3900], parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif action == "bots":
-        await send_bots(query.message, query.from_user.id, admin=True)
+        page = 1
+        if data.startswith("admin:bots_page:"):
+            try:
+                page = max(1, int(data.split(":")[-1]))
+            except (ValueError, IndexError):
+                page = 1
+        await send_bots(query.message, query.from_user.id, admin=True, page=page)
     elif action == "ban":
         PENDING[query.from_user.id] = {"action": "ban"}
         await query.message.reply_text("🚫 أرسل chat_id العضو الذي تريد حظره.", reply_markup=admin_keyboard())
@@ -677,11 +783,36 @@ async def admin_callback(query, data: str) -> None:
         else:
             await query.message.reply_text("لا توجد إذاعة قيد التنفيذ حاليًا.", reply_markup=admin_keyboard())
     elif action == "audit":
-        rows = db.get_audit_log(50)
-        lines = ["🧾 <b>سجل التدقيق</b>", ""]
-        for row in rows:
-            lines.append(f"<code>{row['ts']}</code> — admin <code>{row['admin_id']}</code> — <b>{html.escape(row['action'])}</b> — {html.escape(row['target'] or '')} — {html.escape(row['details'] or '')}")
-        await query.message.reply_text("\n".join(lines)[:3900], parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+        page = 1
+        if data.startswith("admin:audit_page:"):
+            try:
+                page = int(data.split(":")[-1])
+            except (ValueError, IndexError):
+                page = 1
+        rows, total = db.get_audit_log_page(page, 50)
+        if not rows:
+            text_value = "🧾 لا يوجد سجل تدقيق بعد."
+        else:
+            lines = ["🧾 <b>سجل التدقيق</b>", ""]
+            for row in rows:
+                lines.append(
+                    f"<code>{row['ts']}</code> — admin <code>{row['admin_id']}</code> — "
+                    f"<b>{html.escape(row['action'])}</b> — {html.escape(row['target'] or '')} — "
+                    f"{html.escape(row['details'] or '')}"
+                )
+            text_value = "\n".join(lines)
+        if total > 50:
+            total_pages = (total + 49) // 50
+            nav = []
+            if page > 1:
+                nav.append(InlineKeyboardButton("◀️ السابقة", callback_data=f"admin:audit_page:{page-1}"))
+            nav.append(InlineKeyboardButton(f"الصفحة {page} من {total_pages}", callback_data="admin:audit"))
+            if page < total_pages:
+                nav.append(InlineKeyboardButton("التالية ▶️", callback_data=f"admin:audit_page:{page+1}"))
+            keyboard = InlineKeyboardMarkup([nav])
+        else:
+            keyboard = admin_keyboard()
+        await query.message.reply_text(text_value[:3900], parse_mode=ParseMode.HTML, reply_markup=keyboard)
     elif action == "back":
         await query.message.reply_text("👑 <b>لوحة إدارة منصة الاستضافة</b>", parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
 
@@ -740,13 +871,20 @@ async def bot_callback(query, data: str) -> None:
         await query.message.reply_text(f"📜 <b>سجل {html.escape(row['name'])}</b>\n\n<pre>{html.escape(content[-3600:])}</pre>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
         return
     elif action == "env":
-        keys = [row["key"] for row in db.list_env_vars(bot_id)]
-        listed = "\n".join(f"• <code>{html.escape(key)}</code>" for key in keys) or "لا توجد متغيرات محفوظة."
+        env_rows = db.list_env_vars(bot_id)
+        listed = "\n".join(
+            f"• <code>{html.escape(r['key'])}</code> — {html.escape(r['display_value'])}"
+            for r in env_rows
+        ) or "لا توجد متغيرات محفوظة."
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ إضافة متغير", callback_data=f"bot:env_add:{bot_id}")],
             [InlineKeyboardButton("🔙 رجوع", callback_data=f"bot:view:{bot_id}")],
         ])
-        await query.message.reply_text(f"🔐 <b>متغيرات البيئة</b>\n\n{listed}\n\nلن أعرض القيم الحساسة في Telegram.", parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await query.message.reply_text(
+            f"🔐 <b>متغيرات البيئة</b>\n\n{listed}\n\nالقيم الحساسة مشفرة ولا تُعرض.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
         return
     elif action == "env_add":
         PENDING[query.from_user.id] = {"action": "env_assignment", "bot_id": bot_id}
@@ -763,9 +901,141 @@ async def bot_callback(query, data: str) -> None:
         else:
             await query.message.reply_text(f"📈 <b>موارد البوت</b>\n\n🧠 CPU: <b>{usage['cpu']}</b>\n💾 الذاكرة: <b>{usage['mem']}</b>\n⏱ التشغيل: <b>{usage['uptime']}</b>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
         return
+    elif action == "export":
+        if not row["folder"] or not os.path.exists(row["folder"]):
+            await query.message.reply_text("⚠️ ملفات البوت غير موجودة للتنزيل.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            return
+        try:
+            zip_path = export_bot_zip(row["folder"], str(Path(row["folder"]).parent / f"bot_{bot_id}_export"))
+            with open(zip_path, "rb") as f:
+                await query.message.reply_document(
+                    document=f,
+                    caption=f"📦 <b>تصدير بوت {html.escape(row['name'])}</b>\n\nملف ZIP جاهز للتحميل.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)),
+                )
+            os.remove(zip_path)
+        except Exception as exc:
+            logger.exception("Export failed for bot %s", bot_id)
+            await query.message.reply_text(f"❌ فشل تصدير البوت: {html.escape(str(exc)[:300])}.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+        return
     elif action == "delete_confirm":
         await query.message.reply_text("⚠️ هل أنت متأكد من حذف البوت وملفاته؟ لا يمكن التراجع عن هذا الإجراء.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("نعم، احذف", callback_data=f"bot:delete:{bot_id}"), InlineKeyboardButton("إلغاء", callback_data=f"bot:view:{bot_id}")]]))
         return
+    elif action == "clone":
+        # Clone bot: create a new bot with same files, env vars, and settings
+        try:
+            original_folder = row["folder"]
+            new_bot_id = db.insert_bot_if_room(query.from_user.id, f"{row['name']} (نسخة)", db.get_max_bots(query.from_user.id))
+            if new_bot_id is None:
+                await query.message.reply_text("⚠️ وصلت إلى الحد المسموح من البوتات.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+                return
+            new_folder = os.path.join(config.BOTS_DIR, str(query.from_user.id), f"bot_{new_bot_id}")
+            if os.path.exists(new_folder):
+                shutil.rmtree(new_folder, ignore_errors=True)
+            shutil.copytree(original_folder, new_folder, ignore=shutil.ignore_patterns(".venv", "run.log", "__pycache__", "*.pyc"))
+            entry_file = row["entry_file"]
+            if entry_file and entry_file.startswith(original_folder):
+                entry_file = entry_file.replace(original_folder, new_folder, 1)
+            db.set_bot_files(new_bot_id, new_folder, entry_file or "")
+            # Copy env vars
+            for key, value in db.get_env_vars(bot_id).items():
+                db.set_env_var(new_bot_id, key, value)
+            # Copy settings
+            if row["max_memory_mb"]:
+                db.set_max_memory(new_bot_id, row["max_memory_mb"])
+            if row["restart_interval_hours"]:
+                db.set_restart_interval(new_bot_id, row["restart_interval_hours"])
+            db.set_auto_restart(new_bot_id, bool(row["auto_restart"]))
+            db.log_admin_action(query.from_user.id, "clone_bot", new_bot_id, f"from_bot={bot_id}")
+            cloned_row = db.get_bot(new_bot_id)
+            await query.message.reply_text(
+                f"✅ <b>تم نسخ البوت بنجاح</b>\n\n"
+                f"🤖 البوت الجديد: <b>{html.escape(cloned_row['name'])}</b>\n"
+                f"🆔 المعرف: <code>{cloned_row['bot_id']}</code>\n\n"
+                f"يمكنك الآن تشغيل البوت أو تحديثه حسب الحاجة.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bot_keyboard(new_bot_id, is_admin(query.from_user.id)),
+            )
+        except Exception as exc:
+            logger.exception("Clone failed for bot %s", bot_id)
+            await query.message.reply_text(f"❌ فشل نسخ البوت: {html.escape(str(exc)[:300])}.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+        return
+
+    elif action == "update":
+        # Update existing bot: re-upload ZIP to replace files
+        if not row["folder"]:
+            await query.message.reply_text("⚠️ لا يوجد ملفات للبوت الحالي لتحديثها.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            return
+        # Stop the bot if running
+        if manager().is_running(bot_id):
+            manager().stop_bot(bot_id)
+        # Keep the current files until the replacement archive passes all checks.
+        # The old folder is removed only after the new folder is finalized successfully.
+        # Set pending state for update
+        PENDING[query.from_user.id] = {"action": "update_archive", "bot_id": bot_id, "bot_name": row["name"]}
+        await query.message.reply_text(
+            f"📦 <b>جاهز لتحديث بوت {html.escape(row['name'])}</b>\n\n"
+            f"أرسل ملف ZIP الجديد. سيتم استبدال ملفات البوت القديمة.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    elif action == "update_archive":
+        # Handle the uploaded ZIP for update
+        if not row["folder"]:
+            await query.message.reply_text("⚠️ البوت غير موجود.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            return
+        document_obj = update.message.document
+        if not document_obj or not document_obj.file_name.lower().endswith(".zip"):
+            await query.message.reply_text("⚠️ أرسل ملف ZIP صالح.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            return
+        if document_obj.file_size and document_obj.file_size > config.MAX_FILE_SIZE_MB * 1024 * 1024:
+            await query.message.reply_text(f"⚠️ حجم الملف أكبر من الحد المسموح ({config.MAX_FILE_SIZE_MB}MB).", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            return
+        temp_folder = make_temp_upload_folder(query.from_user.id, f"update_{bot_id}")
+        archive_path = os.path.join(temp_folder, "upload.zip")
+        progress = await update.message.reply_text(progress_text("تحديث البوت", 10, "جارٍ تنزيل الملف..."), parse_mode=ParseMode.HTML)
+        try:
+            telegram_file = await document_obj.get_file()
+            await telegram_file.download_to_drive(archive_path)
+            await edit_progress(progress, "تحديث البوت", 35, "تم تنزيل الملف، جارٍ فحص الأرشيف...")
+            await asyncio.to_thread(extract_zip, archive_path, temp_folder)
+            await edit_progress(progress, "تحديث البوت", 60, "تم فك الأرشيف، جارٍ البحث عن ملف التشغيل...")
+            entry = await asyncio.to_thread(find_entry_file, temp_folder)
+            if not entry:
+                raise ValueError("لم أجد ملف Python للتشغيل. استخدم main.py أو bot.py أو app.py.")
+            valid, error = await asyncio.to_thread(check_syntax, entry)
+            if not valid:
+                raise ValueError(f"خطأ في صياغة ملف التشغيل: {error}")
+            await edit_progress(progress, "تحديث البوت", 80, "تم التحقق، جارٍ استبدال الملفات...")
+            # Remove old folder and move new one
+            old_folder = row["folder"]
+            new_folder = await asyncio.to_thread(finalize_bot_folder, temp_folder, query.from_user.id, bot_id)
+            if old_folder and os.path.abspath(old_folder) != os.path.abspath(new_folder) and os.path.exists(old_folder):
+                shutil.rmtree(old_folder, ignore_errors=True)
+            entry_final = entry.replace(temp_folder, new_folder, 1)
+            db.set_bot_files(bot_id, new_folder, entry_final)
+            db.log_admin_action(query.from_user.id, "update_bot", bot_id, f"entry={os.path.basename(entry_final)}")
+            PENDING.pop(query.from_user.id, None)
+            updated_row = db.get_bot(bot_id)
+            await edit_progress(progress, "تحديث البوت", 100, "تم تحديث البوت بنجاح!", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            await update.message.reply_text(
+                "✅ <b>تم تحديث البوت بنجاح</b>\n\n"
+                + bot_summary(updated_row)
+                + "\n\nاضغط تشغيل لتشغيل النسخة المحدثة.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)),
+            )
+        except Exception as exc:
+            logger.exception("Update failed for bot %s", bot_id)
+            delete_folder(temp_folder)
+            PENDING.pop(query.from_user.id, None)
+            await edit_progress(progress, "تحديث البوت", 100, f"فشل التحديث: {str(exc)[:160]}", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            await update.message.reply_text(f"❌ لم أستطع تحديث البوت. السبب: <code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+        return
+
     elif action == "delete":
         manager().stop_bot(bot_id)
         delete_folder(row["folder"])
@@ -779,14 +1049,91 @@ async def bot_callback(query, data: str) -> None:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path not in {"/", "/health", "/healthz"}:
+        if self.path == "/metrics":
+            self._send_metrics()
+        elif self.path in {"/", "/health", "/healthz"}:
+            self._send_health()
+        else:
             self.send_response(404)
             self.end_headers()
-            return
+
+    def _send_health(self):
         stats = db.global_stats()
-        body = json.dumps({"status": "ok", "service": "telegram-bot-hosting", "uptime_seconds": round(time.time() - STARTED_AT, 2), **stats}, ensure_ascii=False).encode()
+        body = json.dumps(
+            {"status": "ok", "service": "telegram-bot-hosting", "uptime_seconds": round(time.time() - STARTED_AT, 2), **stats},
+            ensure_ascii=False,
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_metrics(self):
+        stats = db.global_stats()
+        with manager().lock:
+            bot_ids = list(manager().processes.keys())
+        total_cpu = 0.0
+        total_mem_mb = 0.0
+        running_bots = 0
+        for bot_id in bot_ids:
+            usage = manager().get_usage(bot_id)
+            if usage:
+                try:
+                    cpu_val = float(usage["cpu"].replace("%", ""))
+                    total_cpu += cpu_val
+                except Exception:
+                    pass
+                try:
+                    mem_str = usage["mem"]
+                    if "MB" in mem_str:
+                        total_mem_mb += float(mem_str.replace("MB", "").strip())
+                    elif "KB" in mem_str:
+                        total_mem_mb += float(mem_str.replace("KB", "").strip()) / 1024
+                except Exception:
+                    pass
+                running_bots += 1
+
+        lines = [
+            "# HELP hosting_total_users Total registered users",
+            "# TYPE hosting_total_users gauge",
+            f"hosting_total_users {stats['total_users']}",
+            "",
+            "# HELP hosting_total_bots Total bots",
+            "# TYPE hosting_total_bots gauge",
+            f"hosting_total_bots {stats['total_bots']}",
+            "",
+            "# HELP hosting_running_bots Currently running bots",
+            "# TYPE hosting_running_bots gauge",
+            f"hosting_running_bots {stats['running']}",
+            "",
+            "# HELP hosting_crashed_bots Crashed bots",
+            "# TYPE hosting_crashed_bots gauge",
+            f"hosting_crashed_bots {stats['crashed']}",
+            "",
+            "# HELP hosting_total_cpu_percent Total CPU usage across all bots",
+            "# TYPE hosting_total_cpu_percent gauge",
+            f"hosting_total_cpu_percent {total_cpu:.2f}",
+            "",
+            "# HELP hosting_total_memory_mb Total memory usage across all bots (MB)",
+            "# TYPE hosting_total_memory_mb gauge",
+            f"hosting_total_memory_mb {total_mem_mb:.2f}",
+            "",
+            "# HELP hosting_uptime_seconds Service uptime in seconds",
+            "# TYPE hosting_uptime_seconds gauge",
+            f"hosting_uptime_seconds {round(time.time() - STARTED_AT, 2)}",
+            "",
+            "# HELP hosting_rate_limit_enabled Whether rate limiting is active",
+            "# TYPE hosting_rate_limit_enabled gauge",
+            f"hosting_rate_limit_enabled {1 if config.RATE_LIMIT_MSGS_PER_MINUTE > 0 else 0}",
+            "",
+            "# HELP hosting_rate_limit_per_minute Max messages per user per minute",
+            "# TYPE hosting_rate_limit_per_minute gauge",
+            f"hosting_rate_limit_per_minute {config.RATE_LIMIT_MSGS_PER_MINUTE}",
+        ]
+        body = "\n".join(lines).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -807,6 +1154,9 @@ async def initialize(application: Application) -> None:
     MANAGER = ProcessManager()
     Thread(target=run_health_server, daemon=True).start()
     Thread(target=manager().watchdog_loop, args=(config.WATCHDOG_INTERVAL,), daemon=True).start()
+    # Start automatic backup scheduler
+    backup_interval = int(os.getenv("BACKUP_INTERVAL_SECONDS", str(backup.BACKUP_INTERVAL_SECONDS)))
+    Thread(target=backup.start_backup_scheduler, args=(backup_interval,), daemon=True).start()
     application.bot_data["initialized_at"] = time.time()
 
 

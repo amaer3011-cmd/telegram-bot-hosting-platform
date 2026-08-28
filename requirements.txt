@@ -1,2 +1,4 @@
 python-telegram-bot==21.6
 psutil>=5.9,<8
+cryptography>=42,<46
+pytest>=8.0

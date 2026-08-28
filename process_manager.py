@@ -168,18 +168,45 @@ class ProcessManager:
     def check_health(self, bot_id):
         """يستدعي getMe بتوكن البوت الفرعي (إن وُجد كمتغير بيئة BOT_TOKEN_ENV_KEY)
         للتأكد أنه متصل فعليًا بتيليجرام، وليس فقط أن عمليته حيّة على مستوى نظام
-        التشغيل. يرجع True/False، أو None إن لم يوجد توكن معرَّف فنتخطى الفحص."""
+        التشغيل. يرجع dict مع تفاصيل الفحص: {status: bool, checks: {getMe: bool, ping: bool}, details: str}."""
         if not self.is_running(bot_id):
-            return None
-        token = db.get_env_vars(bot_id).get(config.BOT_TOKEN_ENV_KEY)
+            return {"status": False, "checks": {}, "details": "Bot process not running"}
+
+        env = db.get_env_vars(bot_id)
+        token = env.get(config.BOT_TOKEN_ENV_KEY)
         if not token:
-            return None
+            return {"status": None, "checks": {}, "details": "No BOT_TOKEN configured"}
+
+        checks = {}
+        details = []
+
+        # Layer 1: getMe - validates token and basic connectivity
+        getme_ok = False
         try:
             url = f"https://api.telegram.org/bot{token}/getMe"
             with urllib.request.urlopen(url, timeout=config.HEALTH_CHECK_TIMEOUT_SECONDS) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
+                getme_ok = resp.status == 200
+                if getme_ok:
+                    import json
+                    data = json.loads(resp.read().decode())
+                    bot_name = data.get("result", {}).get("username", "unknown")
+                    details.append(f"getMe OK: @{bot_name}")
+                else:
+                    details.append("getMe failed: HTTP error")
+        except Exception as exc:
+            details.append(f"getMe error: {exc}")
+        checks["getMe"] = getme_ok
+
+        # Layer 2: sendMessage ping (optional, only if we know a chat_id to ping)
+        # We'll skip actual sendMessage to avoid spamming, but could be added
+        # if a specific test chat_id is configured.
+        # For now, we just return getMe result.
+        ping_ok = None  # Not implemented by default
+        checks["ping"] = ping_ok
+
+        # Overall status: healthy if getMe succeeded
+        overall = getme_ok
+        return {"status": overall, "checks": checks, "details": "; ".join(details) if details else "No checks performed"}
 
     # ---------------- الحارس التلقائي (Watchdog) ----------------
 
@@ -251,30 +278,28 @@ class ProcessManager:
         running_in_db = db.get_bots_by_status("running")
         for bot_row in running_in_db:
             bot_id = bot_row["bot_id"]
-            if self.is_running(bot_id):
-                continue  # البوت يعمل فعليًا، لا شيء لفعله
-
-            with self._recovering_lock:
-                if bot_id in self._recovering:
-                    continue  # محاولة إعادة تشغيل لهذا البوت جارية بالفعل
-                self._recovering.add(bot_id)
-
-            # البوت متوقف فعليًا رغم أنه مسجَّل "running" في قاعدة البيانات => توقف غير متوقع
-            if not bot_row["auto_restart"]:
-                db.update_status(bot_id, "crashed")
-                if self.notifier:
-                    self.notifier(
-                        bot_row["owner_id"],
-                        f"❌ توقف بوتك «{bot_row['name']}» بشكل غير متوقع، "
-                        f"وخاصية إعادة التشغيل التلقائي معطّلة له.",
-                    )
+            if not self.is_running(bot_id):
+                # البوت متوقف فعليًا رغم أنه مسجَّل "running" في قاعدة البيانات => توقف غير متوقع
                 with self._recovering_lock:
-                    self._recovering.discard(bot_id)
-                continue
+                    if bot_id in self._recovering:
+                        continue  # محاولة إعادة تشغيل لهذا البوت جارية بالفعل
+                    self._recovering.add(bot_id)
 
-            # ننفّذ اكتشاف/تسجيل التعطل ومحاولة الإصلاح في خيط منفصل حتى لا نحجب
-            # فحص بقية البوتات في نفس دورة الـ watchdog أثناء انتظار التأخير التصاعدي
-            threading.Thread(target=self._handle_crash, args=(bot_row,), daemon=True).start()
+                if not bot_row["auto_restart"]:
+                    db.update_status(bot_id, "crashed")
+                    if self.notifier:
+                        self.notifier(
+                            bot_row["owner_id"],
+                            f"❌ توقف بوتك «{bot_row['name']}» بشكل غير متوقع، "
+                            f"وخاصية إعادة التشغيل التلقائي معطّلة له.",
+                        )
+                    with self._recovering_lock:
+                        self._recovering.discard(bot_id)
+                    continue
+
+                # ننفّذ معالجة التعطل فقط بعد التأكد أن العملية توقفت فعليًا.
+                # لا نرسل العمليات السليمة إلى مسار crash recovery.
+                threading.Thread(target=self._handle_crash, args=(bot_row,), daemon=True).start()
 
     def _handle_crash(self, bot_row):
         bot_id = bot_row["bot_id"]
