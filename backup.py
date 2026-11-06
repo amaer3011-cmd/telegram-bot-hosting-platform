@@ -48,6 +48,19 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 (BACKUP_DIR / "logs").mkdir(exist_ok=True)
 
 
+_SKIP_PARTS = {".venv", "__pycache__", ".tmp"}
+
+
+def _bot_filter(info: tarfile.TarInfo):
+    """يستثني البيئة الافتراضية والملفات المؤقتة والسجلات من أرشيف البوتات
+    (tar.add(exclude=...) أُزيل من بايثون 3.7 وكان يسبب فشل النسخ دائمًا)."""
+    parts = set(info.name.split("/"))
+    base = os.path.basename(info.name)
+    if parts & _SKIP_PARTS or base == "run.log" or base.startswith("run.log."):
+        return None
+    return info
+
+
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -82,13 +95,19 @@ def backup_database() -> Path | None:
     if not BACKUP_DB:
         return None
     try:
-        src = sqlite3.connect(str(config.DB_PATH))
         dst_path = BACKUP_DIR / "db" / f"hosting_{_timestamp()}.db"
+        src = sqlite3.connect(str(config.DB_PATH))
         dst = sqlite3.connect(str(dst_path))
-        with dst:
-            src.backup(dst)
-        src.close()
-        dst.close()
+        try:
+            with dst:
+                src.backup(dst)
+            ok = dst.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            src.close()
+            dst.close()
+        if not ok:
+            dst_path.unlink(missing_ok=True)
+            raise RuntimeError("backup integrity check failed")
         _cleanup_old("db")
         return dst_path
     except Exception as exc:
@@ -121,7 +140,7 @@ def backup_bot_folders() -> Path | None:
                         if not bot_dir.is_dir():
                             continue
                         arcname = bot_dir.relative_to(bots_dir)
-                        tar.add(bot_dir, arcname=arcname, exclude=lambda m: m.endswith(".venv") or m.endswith("run.log"))
+                        tar.add(bot_dir, arcname=str(arcname), filter=_bot_filter)
         _cleanup_old("bots")
         return archive_path
     except Exception as exc:
@@ -210,6 +229,7 @@ def start_backup_scheduler(interval: int = BACKUP_INTERVAL_SECONDS) -> None:
 
         logger = logging.getLogger("backup")
         logger.info("Backup scheduler started (interval=%s seconds)", interval)
+        _backup_stop_event.wait(120)  # لا نزاحم استرداد البوتات لحظة الإقلاع
         while not _backup_stop_event.is_set():
             try:
                 result = run_backup_cycle()

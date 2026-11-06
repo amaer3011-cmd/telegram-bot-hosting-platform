@@ -37,12 +37,20 @@ _master_key: bytes | None = None
 _fernet: Fernet | None = None
 
 
+def _key_file_path() -> Path:
+    """مسار ملف المفتاح المولَّد تلقائيًا (داخل نفس Volume قاعدة البيانات)."""
+    base = os.getenv("DATABASE_PATH")
+    directory = Path(base).resolve().parent if base else Path(__file__).resolve().parent / "data"
+    return directory / ".encryption_key"
+
+
 def _load_master_key() -> bytes:
     """Load or generate the master encryption key.
 
     Priority:
-        1. ENCRYPTION_KEY env var (base64-encoded 32-byte key)
-        2. Auto-generated ephemeral key (logged a warning, only for dev)
+        1. ENCRYPTION_KEY env var (Fernet key: url-safe base64 of 32 bytes)
+        2. A key persisted in the data volume (.encryption_key, mode 0600),
+           generated on first run so encrypted values survive restarts.
     """
     global _master_key, _fernet
     if _master_key is not None:
@@ -51,19 +59,37 @@ def _load_master_key() -> bytes:
     env_key = os.getenv("ENCRYPTION_KEY", "").strip()
     if env_key:
         try:
-            # Accept both raw base64 and the Fernet.generate_key() format
-            _master_key = base64.urlsafe_b64decode(env_key)
+            # Fernet expects the url-safe base64 text itself (not the decoded bytes)
+            _fernet = Fernet(env_key.encode("ascii"))
+            _master_key = env_key.encode("ascii")
         except Exception as exc:
             logger.error("Invalid ENCRYPTION_KEY format: %s", exc)
-            raise RuntimeError("ENCRYPTION_KEY must be a valid base64-encoded 32-byte key") from exc
-    else:
-        logger.warning(
-            "ENCRYPTION_KEY is not set. Using an auto-generated ephemeral key. "
-            "All encrypted values will be LOST on restart. Set a permanent key in production."
-        )
-        _master_key = Fernet.generate_key()
+            raise RuntimeError(
+                "ENCRYPTION_KEY must be a Fernet key (url-safe base64, 32 bytes). Generate one with: "
+                "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            ) from exc
+        return _master_key
 
-    _fernet = Fernet(_master_key)
+    key_path = _key_file_path()
+    try:
+        if key_path.exists():
+            _master_key = key_path.read_bytes().strip()
+        else:
+            _master_key = Fernet.generate_key()
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(key_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(_master_key)
+            logger.warning(
+                "ENCRYPTION_KEY is not set: generated a persistent key at %s. "
+                "Prefer setting ENCRYPTION_KEY as a secret variable.",
+                key_path,
+            )
+        _fernet = Fernet(_master_key)
+    except OSError:
+        logger.warning("Could not persist an encryption key; using an ephemeral key (values lost on restart).")
+        _master_key = Fernet.generate_key()
+        _fernet = Fernet(_master_key)
     return _master_key
 
 
@@ -74,15 +100,35 @@ def get_fernet() -> Fernet:
     return _fernet
 
 
-def rotate_key(new_base64_key: str) -> None:
-    """Rotate to a new master key (for key rotation scenarios).
+def rotate_key(new_base64_key: str) -> int:
+    """Rotate to a new master key and re-encrypt every stored value with it.
 
-    DOES NOT re-encrypt existing values — call reencrypt_all_values() afterwards.
+    Old values are decrypted with the current key first, so nothing is lost.
+    Returns the number of re-encrypted values. Remember to update the
+    ENCRYPTION_KEY variable to the new key afterwards.
     """
     global _master_key, _fernet
-    new_key = base64.urlsafe_b64decode(new_base64_key.strip())
-    _master_key = new_key
-    _fernet = Fernet(new_key)
+    import database as db
+
+    old = get_fernet()
+    new_key = new_base64_key.strip().encode("ascii")
+    new = Fernet(new_key)
+
+    count = 0
+    for row in db.get_all_env_rows():
+        value = row["value"]
+        if not is_encrypted(value):
+            continue
+        try:
+            plain = old.decrypt(value.encode("ascii"))
+        except InvalidToken:
+            logger.warning("Skipping bot %s key %s (cannot decrypt with current key)", row["bot_id"], row["key"])
+            continue
+        db.set_env_raw(row["id"], new.encrypt(plain).decode("ascii"))
+        count += 1
+    _master_key, _fernet = new_key, new
+    logger.info("Re-encrypted %d environment variable values", count)
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -110,43 +156,5 @@ def decrypt_value(token: str) -> str:
 
 
 def is_encrypted(token: str) -> bool:
-    """Heuristic: an encrypted token is a base64 string that decrypts cleanly."""
-    if not token or len(token) < 32:
-        return False
-    try:
-        decrypt_value(token)
-        return True
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Bulk re-encryption (for key rotation / migration)
-# ---------------------------------------------------------------------------
-
-def reencrypt_all_values() -> int:
-    """Re-encrypt every currently-encrypted value with the active key.
-
-    Call this after rotate_key() to bring all existing records in sync.
-    Returns the number of values re-encrypted.
-    """
-    import database as db
-
-    rows = db.list_env_vars(None)  # type: ignore[arg-type]
-    if not rows:
-        return 0
-
-    count = 0
-    for row in rows:
-        value = row["value"]
-        if is_encrypted(value):
-            try:
-                decrypted = decrypt_value(value)
-                encrypted = encrypt_value(decrypted)
-                if encrypted != value:
-                    db.set_env_var(row["bot_id"], row["key"], encrypted)
-                    count += 1
-            except Exception:
-                logger.warning("Skipping re-encryption for bot %s key %s", row["bot_id"], row["key"])
-    logger.info("Re-encrypted %d environment variable values", count)
-    return count
+    """Cheap check: Fernet tokens are base64 text that always starts with 'gAAAA'."""
+    return bool(token) and len(token) >= 32 and token.startswith("gAAAA")

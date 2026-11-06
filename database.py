@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import threading
 import time
@@ -7,8 +8,14 @@ import env_crypto
 
 _lock = threading.Lock()
 _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+try:  # القاعدة (وملفا -wal و-shm الذان يرثان صلاحياتها) لا يقرؤها إلا مالكها
+    os.chmod(DB_PATH, 0o600)
+except OSError:
+    pass
 _conn.row_factory = sqlite3.Row
 _conn.execute("PRAGMA journal_mode=WAL")
+_conn.execute("PRAGMA synchronous=NORMAL")
+_conn.execute("PRAGMA busy_timeout=5000")
 _conn.execute("PRAGMA foreign_keys=ON")
 
 
@@ -78,6 +85,9 @@ def init_db():
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_usage_history_bot ON usage_history(bot_id, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bots_status ON bots(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_env_vars_bot ON env_vars(bot_id)")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -89,6 +99,8 @@ def init_db():
                 ts INTEGER
             )
         """)
+        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
         _conn.commit()
 
 
@@ -365,6 +377,41 @@ def list_env_vars(bot_id):
         return [{"id": r["id"], "key": r["key"], "display_value": r["display_value"]} for r in cur.fetchall()]
 
 
+def get_all_env_rows():
+    """كل صفوف env_vars كما هي مخزنة (للتدوير الدوري لمفتاح التشفير)."""
+    with _lock:
+        return _conn.execute("SELECT id, bot_id, key, value FROM env_vars").fetchall()
+
+
+def set_env_raw(env_id, raw_value):
+    with _lock:
+        _conn.execute("UPDATE env_vars SET value=? WHERE id=?", (raw_value, env_id))
+        _conn.commit()
+
+
+def delete_env_var_for_bot(bot_id, env_id):
+    """يحذف متغيرًا بشرط أن يتبع البوت المحدد (منع حذف متغير بوت غيرك بتخمين المعرّف)."""
+    with _lock:
+        cur = _conn.execute("DELETE FROM env_vars WHERE id=? AND bot_id=?", (env_id, bot_id))
+        _conn.commit()
+        return cur.rowcount > 0
+
+
+def get_setting(key, default=None):
+    with _lock:
+        row = _conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key, value):
+    with _lock:
+        _conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        _conn.commit()
+
+
 def delete_env_var(env_id):
     with _lock:
         _conn.execute("DELETE FROM env_vars WHERE id=?", (env_id,))
@@ -383,6 +430,15 @@ def update_last_started(bot_id, ts=None):
             "UPDATE bots SET last_started_at=? WHERE bot_id=?", (ts or int(time.time()), bot_id)
         )
         _conn.commit()
+
+
+def prune_audit_log(keep_days=90):
+    """يحذف سجل التدقيق الأقدم من keep_days لمنع نمو الجدول بلا حدود."""
+    cutoff = int(time.time()) - keep_days * 86400
+    with _lock:
+        cur = _conn.execute("DELETE FROM audit_log WHERE ts < ?", (cutoff,))
+        _conn.commit()
+        return cur.rowcount
 
 
 def get_bots_with_scheduled_restart():

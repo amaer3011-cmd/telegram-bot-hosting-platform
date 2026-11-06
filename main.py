@@ -15,29 +15,41 @@ from telegram.constants import ParseMode
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 import config
 import database as db
 import shutil
+
+import psutil
+
 import backup
+from ratelimit import RateLimiter
 from env_crypto import encrypt_value, decrypt_value
 from process_manager import ProcessManager
 from ai_analyzer import analyze_bot, AnalysisResult
 from utils import (
     check_syntax,
     delete_folder,
+    dir_size_bytes,
     export_bot_zip,
     extract_zip,
     finalize_bot_folder,
     find_entry_file,
+    flatten_single_root,
+    human_size,
     make_temp_upload_folder,
+    parse_env_text,
+    safe_display_filename,
+    sparkline,
     tail_file,
 )
 
@@ -48,6 +60,39 @@ MANAGER: ProcessManager | None = None
 BROADCAST_TASK: asyncio.Task | None = None
 BROADCAST_CANCEL: asyncio.Event | None = None
 STARTED_AT = time.time()
+LIMITER = RateLimiter(config.RATE_LIMIT_MSGS_PER_MINUTE)
+
+
+async def rate_limit_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """يعمل قبل كل المعالجات: يحجب المستخدم العادي المفرط في الرسائل/الضغطات."""
+    user = update.effective_user
+    if not user or is_admin(user.id) or LIMITER.allow(user.id):
+        return
+    if LIMITER.should_warn(user.id):
+        notice = "⏳ أنت ترسل طلبات كثيرة. انتظر دقيقة ثم حاول مجددًا."
+        if update.callback_query:
+            await update.callback_query.answer(notice, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(notice)
+    raise ApplicationHandlerStop
+
+
+def maintenance_on() -> bool:
+    return db.get_setting("maintenance", "0") == "1"
+
+
+async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """في وضع الصيانة يُحجب المستخدمون العاديون عن بوت التحكم فقط؛ البوتات المستضافة
+    تبقى تعمل، والأدمن يستمر بالتحكم."""
+    user = update.effective_user
+    if not user or is_admin(user.id) or not maintenance_on():
+        return
+    notice = "🛠 المنصة في وضع الصيانة حاليًا. بوتاتك تعمل بشكل طبيعي. حاول لاحقًا."
+    if update.callback_query:
+        await update.callback_query.answer(notice, show_alert=True)
+    elif update.message:
+        await update.message.reply_text(notice)
+    raise ApplicationHandlerStop
 
 
 def is_admin(user_id: int | None) -> bool:
@@ -89,6 +134,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🤖 كل البوتات", callback_data="admin:bots"), InlineKeyboardButton("🧾 سجل التدقيق", callback_data="admin:audit")],
         [InlineKeyboardButton("🚫 حظر عضو", callback_data="admin:ban"), InlineKeyboardButton("✅ فك الحظر", callback_data="admin:unban")],
         [InlineKeyboardButton("🎛 حدود الأعضاء", callback_data="admin:limit"), InlineKeyboardButton("🛑 إيقاف كل البوتات", callback_data="admin:stop_all_confirm")],
+        [InlineKeyboardButton("🏆 الأكثر استهلاكاً", callback_data="admin:top"), InlineKeyboardButton("🛠 وضع الصيانة", callback_data="admin:maintenance")],
         [InlineKeyboardButton("📢 إذاعة رسالة", callback_data="admin:broadcast"), InlineKeyboardButton("🛑 إيقاف الإذاعة", callback_data="admin:broadcast_cancel")],
         [InlineKeyboardButton("🔙 الرئيسية", callback_data="menu")],
     ])
@@ -100,7 +146,9 @@ def bot_keyboard(bot_id: int, admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔁 إعادة تشغيل", callback_data=f"bot:restart:{bot_id}"), InlineKeyboardButton("📜 السجل", callback_data=f"bot:logs:{bot_id}")],
         [InlineKeyboardButton("📈 الموارد", callback_data=f"bot:usage:{bot_id}"), InlineKeyboardButton("🔐 البيئة", callback_data=f"bot:env:{bot_id}")],
         [InlineKeyboardButton("🧠 الذاكرة", callback_data=f"bot:memory:{bot_id}"), InlineKeyboardButton("♻️ إعادة تلقائية", callback_data=f"bot:auto:{bot_id}")],
-        [InlineKeyboardButton("⏰ جدولة", callback_data=f"bot:schedule:{bot_id}")],
+        [InlineKeyboardButton("⏰ جدولة", callback_data=f"bot:schedule:{bot_id}"), InlineKeyboardButton("🩺 فحص الصحة", callback_data=f"bot:health:{bot_id}")],
+        [InlineKeyboardButton("📥 تحميل السجل كاملاً", callback_data=f"bot:logs_full:{bot_id}")],
+        [InlineKeyboardButton("✏️ إعادة تسمية", callback_data=f"bot:rename:{bot_id}"), InlineKeyboardButton("🔧 إعادة بناء البيئة", callback_data=f"bot:rebuild:{bot_id}")],
         [InlineKeyboardButton("📦 تصدير", callback_data=f"bot:export:{bot_id}"), InlineKeyboardButton("📋 نسخ", callback_data=f"bot:clone:{bot_id}")],
         [InlineKeyboardButton("🔄 تحديث", callback_data=f"bot:update:{bot_id}"), InlineKeyboardButton("🗑 حذف", callback_data=f"bot:delete_confirm:{bot_id}")],
         [InlineKeyboardButton("🔙 بوتاتي" if not admin else "🔙 لوحة الإدارة", callback_data="my_bots" if not admin else "admin:back")],
@@ -329,6 +377,26 @@ async def document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     user_id = update.effective_user.id
     pending = PENDING.get(user_id, {})
+    if pending.get("action") == "env_assignment":
+        doc = update.message.document
+        if doc.file_size and doc.file_size > 64 * 1024:
+            await update.message.reply_text("⚠️ ملف .env كبير جدًا (الحد 64KB).")
+            return
+        row = owned_bot(int(pending["bot_id"]), user_id)
+        if not row:
+            return
+        raw = bytes(await (await doc.get_file()).download_as_bytearray())
+        pairs, bad_lines = parse_env_text(raw.decode("utf-8", errors="ignore"))
+        if not pairs:
+            await update.message.reply_text("⚠️ لم أجد أسطر KEY=VALUE صالحة في الملف.")
+            return
+        saved, rejected = save_env_pairs(row["bot_id"], user_id, pairs)
+        PENDING.pop(user_id, None)
+        await update.message.reply_text(
+            env_report(saved, rejected) + (f"\n⚠️ أسطر غير مفهومة: {len(bad_lines)}" if bad_lines else ""),
+            parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id)),
+        )
+        return
     if pending.get("action") != "archive":
         await update.message.reply_text("📦 ابدأ أولًا من زر «إضافة بوت»، ثم أرسل ملف ZIP.")
         return
@@ -348,6 +416,7 @@ async def document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await telegram_file.download_to_drive(archive_path)
         await edit_progress(progress, "تجهيز البوت", 35, "تم تنزيل الملف، جارٍ فحص الأرشيف...")
         await asyncio.to_thread(extract_zip, archive_path, temp_folder)
+        await asyncio.to_thread(flatten_single_root, temp_folder)
         await edit_progress(progress, "تجهيز البوت", 60, "تم فك الأرشيف بأمان، جارٍ تحليل البوت بالذكاء الاصطناعي...")
         
         # AI-powered bot analysis
@@ -452,34 +521,43 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"✅ تم ضبط الحد الأقصى للعضو على {max_bots} بوتات.", reply_markup=admin_keyboard())
         return
     if action == "env_assignment":
-        if "=" not in value:
-            await update.message.reply_text(
-                "⚠️ اكتب المتغير بهذا الشكل: <code>KEY=VALUE</code>\n\n"
-                "مثال للتوكن: <code>BOT_TOKEN=123456:ABCxyz</code>",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        key, env_value = (part.strip() for part in value.split("=", 1))
-        key = key.upper()
         row = owned_bot(int(pending["bot_id"]), user_id)
-        if not row or not is_valid_env_key(key) or key in config.PROTECTED_ENV_KEYS or "\x00" in env_value:
-            await update.message.reply_text("⚠️ اسم المتغير غير صالح أو محمي.")
+        pairs, bad_lines = parse_env_text(value)
+        if not row or (not pairs and not bad_lines):
+            await update.message.reply_text("⚠️ لا يوجد ما يمكن حفظه.")
             return
-        db.set_env_var(row["bot_id"], key, env_value)
-        db.log_admin_action(user_id, "set_env", row["bot_id"], f"key={key}")
-        PENDING.pop(user_id, None)
-        
-        # Special message for BOT_TOKEN
-        if key == "BOT_TOKEN":
+        if not pairs:
             await update.message.reply_text(
-                f"✅ تم حفظ <code>{html.escape(key)}</code> بنجاح!\n\n"
-                "🎯 الآن يمكنك تشغيل البوت بالضغط على زر «تشغيل».\n"
-                "إذا لم يعمل، تأكد من أن التوكن صحيح وأن البوت لديه صلاحيات كافية.",
+                "⚠️ اكتب المتغير بهذا الشكل: <code>KEY=VALUE</code>\n\nمثال للتوكن: <code>BOT_TOKEN=123456:ABCxyz</code>\n"
+                "ويمكنك لصق عدة أسطر دفعة واحدة أو إرسال ملف <code>.env</code>.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id))
             )
-        else:
-            await update.message.reply_text(f"✅ تم حفظ <code>{html.escape(key)}</code>. أعد تشغيل البوت لتطبيقه.", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id)))
+            return
+        saved, rejected = save_env_pairs(row["bot_id"], user_id, pairs)
+        PENDING.pop(user_id, None)
+        extra = f"\n⚠️ أسطر غير مفهومة: {len(bad_lines)}" if bad_lines else ""
+        hint = ""
+        if "BOT_TOKEN" in saved:
+            hint = "\n🎯 تم حفظ التوكن؛ شغّل البوت الآن."
+        await update.message.reply_text(
+            env_report(saved, rejected) + extra + hint,
+            parse_mode=ParseMode.HTML,
+            reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id)),
+        )
+        return
+    if action == "rename_bot":
+        row = owned_bot(int(pending["bot_id"]), user_id)
+        new_name = " ".join(value.split())
+        if not row or not (1 <= len(new_name) <= 40):
+            await update.message.reply_text("⚠️ الاسم يجب أن يكون بين 1 و40 حرفًا.")
+            return
+        db.rename_bot(row["bot_id"], new_name)
+        db.log_admin_action(user_id, "rename_bot", row["bot_id"], new_name)
+        PENDING.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ أصبح اسم البوت «{html.escape(new_name)}».", parse_mode=ParseMode.HTML,
+            reply_markup=bot_keyboard(row["bot_id"], is_admin(user_id)),
+        )
         return
     if action == "memory_assignment":
         row = owned_bot(int(pending["bot_id"]), user_id)
@@ -578,6 +656,7 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await telegram_file.download_to_drive(archive_path)
             await edit_progress(progress, "تحديث البوت", 35, "تم تنزيل الملف، جارٍ فحص الأرشيف...")
             await asyncio.to_thread(extract_zip, archive_path, temp_folder)
+            await asyncio.to_thread(flatten_single_root, temp_folder)
             await edit_progress(progress, "تحديث البوت", 60, "تم فك الأرشيف، جارٍ البحث عن ملف التشغيل...")
             entry = await asyncio.to_thread(find_entry_file, temp_folder)
             if not entry:
@@ -642,6 +721,27 @@ async def set_env(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db.set_env_var(bot_id, key, value)
     db.log_admin_action(update.effective_user.id, "set_env", bot_id, f"key={key}")
     await update.message.reply_text(f"✅ تم حفظ المتغير <code>{html.escape(key)}</code>.\nلن أعرض قيمته في الواجهة.", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(update.effective_user.id)))
+
+
+def save_env_pairs(bot_id: int, user_id: int, pairs) -> tuple[list[str], list[str]]:
+    """يحفظ أزواج KEY/VALUE بعد التحقق. يرجع (المحفوظة, المرفوضة)."""
+    saved, rejected = [], []
+    for key, env_value in pairs:
+        if not is_valid_env_key(key) or key in config.PROTECTED_ENV_KEYS or "\x00" in env_value:
+            rejected.append(key)
+            continue
+        db.set_env_var(bot_id, key, env_value)
+        saved.append(key)
+    if saved:
+        db.log_admin_action(user_id, "set_env", bot_id, "keys=" + ",".join(saved))
+    return saved, rejected
+
+
+def env_report(saved, rejected) -> str:
+    text_out = f"✅ تم حفظ <b>{len(saved)}</b> متغير: " + ", ".join(f"<code>{html.escape(k)}</code>" for k in saved[:15])
+    if rejected:
+        text_out += f"\n⚠️ مرفوض ({len(rejected)}): " + ", ".join(f"<code>{html.escape(str(k))}</code>" for k in rejected[:10])
+    return text_out + "\n\nأعد تشغيل البوت لتطبيق التغييرات."
 
 
 def is_valid_env_key(key: str) -> bool:
@@ -767,15 +867,51 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await bot_callback(query, data)
 
 
+def disk_line() -> str:
+    try:
+        usage = shutil.disk_usage(config.DB_PATH.parent)
+    except OSError:
+        return ""
+    state = "\n🛠 وضع الصيانة: <b>مفعّل</b>" if maintenance_on() else ""
+    return f"\n💽 التخزين: <b>{usage.free / usage.total * 100:.0f}%</b> حر ({usage.free // 1048576}MB){state}"
+
+
 async def admin_callback(query, data: str) -> None:
     if not is_admin(query.from_user.id):
         await query.message.reply_text("🚫 ليس لديك صلاحية الوصول إلى هذا القسم.")
         return
     action = data.split(":", 1)[1]
-    if action == "stats":
+    if action == "maintenance":
+        new_value = "0" if maintenance_on() else "1"
+        db.set_setting("maintenance", new_value)
+        db.log_admin_action(query.from_user.id, "maintenance", "", new_value)
+        await query.message.reply_text(
+            "🛠 وضع الصيانة <b>مفعّل</b>: المستخدمون العاديون محجوبون عن بوت التحكم، والبوتات المستضافة تعمل."
+            if new_value == "1" else "✅ تم إيقاف وضع الصيانة.",
+            parse_mode=ParseMode.HTML, reply_markup=admin_keyboard(),
+        )
+    elif action == "top":
+        def collect():
+            items = []
+            for r in db.get_bots_by_status("running"):
+                u = manager().get_usage(r["bot_id"], fast=True)
+                if u:
+                    items.append((u["mem_bytes"], u["cpu_value"], r))
+            return sorted(items, key=lambda x: x[0], reverse=True)[:10]
+
+        items = await asyncio.to_thread(collect)
+        if not items:
+            body = "لا توجد بوتات عاملة الآن."
+        else:
+            body = "\n".join(
+                f"{i}. <b>{html.escape(r['name'] or str(r['bot_id']))}</b> — 💾 {human_size(mem)} · 🧠 {cpu:.0f}% · 👤 <code>{r['owner_id']}</code>"
+                for i, (mem, cpu, r) in enumerate(items, 1)
+            )
+        await query.message.reply_text(f"🏆 <b>الأكثر استهلاكًا للذاكرة</b>\n\n{body}", parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+    elif action == "stats":
         stats = db.global_stats()
         await query.message.reply_text(
-            f"📊 <b>إحصائيات المنصة</b>\n\n👥 المستخدمون: <b>{stats['total_users']}</b>\n🤖 إجمالي البوتات: <b>{stats['total_bots']}</b>\n🟢 العاملة: <b>{stats['running']}</b>\n🔴 المتعطلة: <b>{stats['crashed']}</b>\n⏱ مدة تشغيل المنصة: <b>{int(time.time() - STARTED_AT)} ثانية</b>",
+            f"📊 <b>إحصائيات المنصة</b>\n\n👥 المستخدمون: <b>{stats['total_users']}</b>\n🤖 إجمالي البوتات: <b>{stats['total_bots']}</b>\n🟢 العاملة: <b>{stats['running']}</b>\n🔴 المتعطلة: <b>{stats['crashed']}</b>\n⏱ مدة تشغيل المنصة: <b>{int(time.time() - STARTED_AT)} ثانية</b>{disk_line()}",
             parse_mode=ParseMode.HTML,
             reply_markup=admin_keyboard(),
         )
@@ -936,20 +1072,72 @@ async def bot_callback(query, data: str) -> None:
         content = tail_file(str(log_path), config.LOG_TAIL_LINES)
         await query.message.reply_text(f"📜 <b>سجل {html.escape(row['name'])}</b>\n\n<pre>{html.escape(content[-3600:])}</pre>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
         return
+    elif action == "logs_full":
+        log_path = Path(row["folder"]) / "run.log"
+        if not log_path.exists() or log_path.stat().st_size == 0:
+            await query.message.reply_text("📥 لا يوجد سجل بعد.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            return
+        # حد تيليجرام للملفات 50MB؛ سجلنا مقتطع عند MAX_LOG_SIZE_MB لذا يكفي عادةً
+        with open(log_path, "rb") as fh:
+            await query.message.reply_document(
+                document=fh,
+                filename=safe_display_filename(row["name"], "_run.log", "bot"),
+                caption=f"📥 السجل الكامل لبوت «{row['name']}»",
+                reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)),
+            )
+        return
+    elif action == "health":
+        result = await asyncio.to_thread(manager().check_health, bot_id)
+        if not manager().is_running(bot_id):
+            text_out = "🩺 البوت متوقف حاليًا؛ شغّله أولًا."
+        elif result["status"] is None:
+            text_out = ("🩺 العملية تعمل، لكن لا يمكن التحقق من اتصاله بتيليجرام.\n"
+                        f"أضف متغير <code>{config.BOT_TOKEN_ENV_KEY}</code> من «🔐 البيئة» لتفعيل الفحص العميق.")
+        elif result["status"]:
+            text_out = f"🩺 <b>البوت سليم</b> ✅\nالعملية تعمل ويتصل بتيليجرام.\n<code>{html.escape(result['details'])}</code>"
+        else:
+            text_out = f"🩺 <b>العملية تعمل لكن الاتصال بتيليجرام فاشل</b> ⚠️\nتحقق من صحة التوكن.\n<code>{html.escape(result['details'])}</code>"
+        await query.message.reply_text(text_out, parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+        return
     elif action == "env":
         env_rows = db.list_env_vars(bot_id)
         listed = "\n".join(
             f"• <code>{html.escape(r['key'])}</code> — {html.escape(r['display_value'])}"
             for r in env_rows
         ) or "لا توجد متغيرات محفوظة."
+        delete_buttons = [
+            [InlineKeyboardButton(f"🗑 حذف {r['key']}", callback_data=f"bot:env_del:{bot_id}:{r['id']}")]
+            for r in env_rows[:20]
+        ]
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ إضافة متغير", callback_data=f"bot:env_add:{bot_id}")],
+            *delete_buttons,
             [InlineKeyboardButton("🔙 رجوع", callback_data=f"bot:view:{bot_id}")],
         ])
         await query.message.reply_text(
             f"🔐 <b>متغيرات البيئة</b>\n\n{listed}\n\nالقيم الحساسة مشفرة ولا تُعرض.",
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
+        )
+        return
+    elif action == "rename":
+        PENDING[query.from_user.id] = {"action": "rename_bot", "bot_id": bot_id}
+        await query.message.reply_text("✏️ أرسل الاسم الجديد للبوت (حتى 40 حرفًا).")
+        return
+    elif action == "rebuild":
+        ok, message = await run_with_progress(
+            query.message, "إعادة بناء البيئة", lambda: manager().rebuild_env(row),
+            bot_keyboard(bot_id, is_admin(query.from_user.id)),
+        )
+    elif action == "env_del":
+        try:
+            env_id = int(parts[3])
+        except (IndexError, ValueError):
+            return
+        removed = db.delete_env_var_for_bot(bot_id, env_id)
+        await query.message.reply_text(
+            "🗑 تم حذف المتغير. أعد تشغيل البوت ليأخذ التغيير." if removed else "⚠️ المتغير غير موجود.",
+            reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)),
         )
         return
     elif action == "env_add":
@@ -959,7 +1147,7 @@ async def bot_callback(query, data: str) -> None:
             "أرسل المتغير بهذا الشكل:\n"
             "<code>BOT_TOKEN=123456:ABCxyz</code>\n\n"
             "حيث <code>123456:ABCxyz</code> هو توكن البوت الذي حصلت عليه من @BotFather.\n"
-            "يمكنك إضافة أي متغيرات أخرى يحتاجها البوت بنفس الطريقة.",
+            "💡 يمكنك لصق <b>عدة أسطر</b> دفعة واحدة، أو إرسال ملف <code>.env</code> مباشرة.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -972,7 +1160,18 @@ async def bot_callback(query, data: str) -> None:
         if not usage:
             await query.message.reply_text("📈 لا تتوفر بيانات موارد الآن؛ تأكد من أن البوت يعمل.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
         else:
-            await query.message.reply_text(f"📈 <b>موارد البوت</b>\n\n🧠 CPU: <b>{usage['cpu']}</b>\n💾 الذاكرة: <b>{usage['mem']}</b>\n⏱ التشغيل: <b>{usage['uptime']}</b>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
+            disk_bytes = await asyncio.to_thread(dir_size_bytes, row["folder"])
+            disk_text = f"\n💽 القرص: <b>{human_size(disk_bytes)}</b>" + (f" من {config.MAX_BOT_DISK_MB}MB" if config.MAX_BOT_DISK_MB else "")
+            history = db.get_usage_history(bot_id, config.USAGE_HISTORY_MAX_POINTS)
+            trend = ""
+            if len(history) >= 3:
+                limit_mb = row["max_memory_mb"] or config.MAX_BOT_MEMORY_MB
+                trend = (
+                    f"\n\n📊 <b>الاتجاه</b> ({len(history)} لقطة)\n"
+                    f"🧠 CPU: <code>{sparkline([h['cpu'] for h in history])}</code>\n"
+                    f"💾 RAM: <code>{sparkline([h['mem_mb'] for h in history], top=limit_mb)}</code> (من {limit_mb}MB)"
+                )
+            await query.message.reply_text(f"📈 <b>موارد البوت</b>\n\n🧠 CPU: <b>{usage['cpu']}</b>\n💾 الذاكرة: <b>{usage['mem']}</b>\n⏱ التشغيل: <b>{usage['uptime']}</b>{disk_text}{trend}", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
         return
     elif action == "export":
         if not row["folder"] or not os.path.exists(row["folder"]):
@@ -1055,60 +1254,6 @@ async def bot_callback(query, data: str) -> None:
         )
         return
 
-    elif action == "update_archive":
-        # Handle the uploaded ZIP for update
-        if not row["folder"]:
-            await query.message.reply_text("⚠️ البوت غير موجود.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
-            return
-        document_obj = update.message.document
-        if not document_obj or not document_obj.file_name.lower().endswith(".zip"):
-            await query.message.reply_text("⚠️ أرسل ملف ZIP صالح.", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
-            return
-        if document_obj.file_size and document_obj.file_size > config.MAX_FILE_SIZE_MB * 1024 * 1024:
-            await query.message.reply_text(f"⚠️ حجم الملف أكبر من الحد المسموح ({config.MAX_FILE_SIZE_MB}MB).", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
-            return
-        temp_folder = make_temp_upload_folder(query.from_user.id, f"update_{bot_id}")
-        archive_path = os.path.join(temp_folder, "upload.zip")
-        progress = await update.message.reply_text(progress_text("تحديث البوت", 10, "جارٍ تنزيل الملف..."), parse_mode=ParseMode.HTML)
-        try:
-            telegram_file = await document_obj.get_file()
-            await telegram_file.download_to_drive(archive_path)
-            await edit_progress(progress, "تحديث البوت", 35, "تم تنزيل الملف، جارٍ فحص الأرشيف...")
-            await asyncio.to_thread(extract_zip, archive_path, temp_folder)
-            await edit_progress(progress, "تحديث البوت", 60, "تم فك الأرشيف، جارٍ البحث عن ملف التشغيل...")
-            entry = await asyncio.to_thread(find_entry_file, temp_folder)
-            if not entry:
-                raise ValueError("لم أجد ملف Python للتشغيل. استخدم main.py أو bot.py أو app.py.")
-            valid, error = await asyncio.to_thread(check_syntax, entry)
-            if not valid:
-                raise ValueError(f"خطأ في صياغة ملف التشغيل: {error}")
-            await edit_progress(progress, "تحديث البوت", 80, "تم التحقق، جارٍ استبدال الملفات...")
-            # Remove old folder and move new one
-            old_folder = row["folder"]
-            new_folder = await asyncio.to_thread(finalize_bot_folder, temp_folder, query.from_user.id, bot_id)
-            if old_folder and os.path.abspath(old_folder) != os.path.abspath(new_folder) and os.path.exists(old_folder):
-                shutil.rmtree(old_folder, ignore_errors=True)
-            entry_final = entry.replace(temp_folder, new_folder, 1)
-            db.set_bot_files(bot_id, new_folder, entry_final)
-            db.log_admin_action(query.from_user.id, "update_bot", bot_id, f"entry={os.path.basename(entry_final)}")
-            PENDING.pop(query.from_user.id, None)
-            updated_row = db.get_bot(bot_id)
-            await edit_progress(progress, "تحديث البوت", 100, "تم تحديث البوت بنجاح!", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
-            await update.message.reply_text(
-                "✅ <b>تم تحديث البوت بنجاح</b>\n\n"
-                + bot_summary(updated_row)
-                + "\n\nاضغط تشغيل لتشغيل النسخة المحدثة.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)),
-            )
-        except Exception as exc:
-            logger.exception("Update failed for bot %s", bot_id)
-            delete_folder(temp_folder)
-            PENDING.pop(query.from_user.id, None)
-            await edit_progress(progress, "تحديث البوت", 100, f"فشل التحديث: {str(exc)[:160]}", reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
-            await update.message.reply_text(f"❌ لم أستطع تحديث البوت. السبب: <code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML, reply_markup=bot_keyboard(bot_id, is_admin(query.from_user.id)))
-        return
-
     elif action == "delete":
         manager().stop_bot(bot_id)
         delete_folder(row["folder"])
@@ -1122,94 +1267,86 @@ async def bot_callback(query, data: str) -> None:
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/metrics":
+        path = self.path.split("?", 1)[0]
+        if path == "/metrics":
             self._send_metrics()
-        elif self.path in {"/", "/health", "/healthz"}:
+        elif path in {"/", "/health", "/healthz"}:
             self._send_health()
         else:
             self.send_response(404)
             self.end_headers()
 
-    def _send_health(self):
-        stats = db.global_stats()
-        body = json.dumps(
-            {"status": "ok", "service": "telegram-bot-hosting", "uptime_seconds": round(time.time() - STARTED_AT, 2), **stats},
-            ensure_ascii=False,
-        ).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+    def _respond(self, code: int, body: bytes, content_type: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_health(self):
+        """فحص صحي حقيقي: القاعدة تستجيب، والحارس ينبض. الحارس الميت يعني أن البوتات
+        لم تعد مراقبة، فنُرجع 503 ليعيد Railway/Docker تشغيل الخدمة."""
+        problems = []
+        stats = {}
+        try:
+            stats = db.global_stats()
+        except Exception as exc:
+            problems.append(f"database: {type(exc).__name__}")
+        mgr = MANAGER
+        watchdog_age = None
+        if mgr is None:
+            problems.append("manager not initialized")
+        elif mgr.boot_recovery_done:
+            watchdog_age = round(time.time() - mgr.last_watchdog_beat, 1)
+            if watchdog_age > max(120, config.WATCHDOG_INTERVAL * 6):
+                problems.append(f"watchdog stalled for {watchdog_age}s")
+        payload = {
+            "status": "ok" if not problems else "unhealthy",
+            "service": "telegram-bot-hosting",
+            "uptime_seconds": round(time.time() - STARTED_AT, 2),
+            "boot_recovery_done": bool(mgr and mgr.boot_recovery_done),
+            "watchdog_age_seconds": watchdog_age,
+            "problems": problems,
+            **stats,
+        }
+        self._respond(200 if not problems else 503, json.dumps(payload, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
     def _send_metrics(self):
         stats = db.global_stats()
-        with manager().lock:
-            bot_ids = list(manager().processes.keys())
+        mgr = manager()
+        with mgr.lock:
+            bot_ids = list(mgr.processes.keys())
         total_cpu = 0.0
-        total_mem_mb = 0.0
-        running_bots = 0
+        total_mem_bytes = 0
         for bot_id in bot_ids:
-            usage = manager().get_usage(bot_id)
+            usage = mgr.get_usage(bot_id, fast=True)
             if usage:
-                try:
-                    cpu_val = float(usage["cpu"].replace("%", ""))
-                    total_cpu += cpu_val
-                except Exception:
-                    pass
-                try:
-                    mem_str = usage["mem"]
-                    if "MB" in mem_str:
-                        total_mem_mb += float(mem_str.replace("MB", "").strip())
-                    elif "KB" in mem_str:
-                        total_mem_mb += float(mem_str.replace("KB", "").strip()) / 1024
-                except Exception:
-                    pass
-                running_bots += 1
+                total_cpu += usage["cpu_value"]
+                total_mem_bytes += usage["mem_bytes"]
+        total_mem_mb = total_mem_bytes / (1024 * 1024)
+        host_mem = psutil.virtual_memory()
+        try:
+            disk = shutil.disk_usage(config.DB_PATH.parent)
+            disk_free_mb, disk_total_mb = disk.free / 1048576, disk.total / 1048576
+        except OSError:
+            disk_free_mb = disk_total_mb = 0.0
 
-        lines = [
-            "# HELP hosting_total_users Total registered users",
-            "# TYPE hosting_total_users gauge",
-            f"hosting_total_users {stats['total_users']}",
-            "",
-            "# HELP hosting_total_bots Total bots",
-            "# TYPE hosting_total_bots gauge",
-            f"hosting_total_bots {stats['total_bots']}",
-            "",
-            "# HELP hosting_running_bots Currently running bots",
-            "# TYPE hosting_running_bots gauge",
-            f"hosting_running_bots {stats['running']}",
-            "",
-            "# HELP hosting_crashed_bots Crashed bots",
-            "# TYPE hosting_crashed_bots gauge",
-            f"hosting_crashed_bots {stats['crashed']}",
-            "",
-            "# HELP hosting_total_cpu_percent Total CPU usage across all bots",
-            "# TYPE hosting_total_cpu_percent gauge",
-            f"hosting_total_cpu_percent {total_cpu:.2f}",
-            "",
-            "# HELP hosting_total_memory_mb Total memory usage across all bots (MB)",
-            "# TYPE hosting_total_memory_mb gauge",
-            f"hosting_total_memory_mb {total_mem_mb:.2f}",
-            "",
-            "# HELP hosting_uptime_seconds Service uptime in seconds",
-            "# TYPE hosting_uptime_seconds gauge",
-            f"hosting_uptime_seconds {round(time.time() - STARTED_AT, 2)}",
-            "",
-            "# HELP hosting_rate_limit_enabled Whether rate limiting is active",
-            "# TYPE hosting_rate_limit_enabled gauge",
-            f"hosting_rate_limit_enabled {1 if config.RATE_LIMIT_MSGS_PER_MINUTE > 0 else 0}",
-            "",
-            "# HELP hosting_rate_limit_per_minute Max messages per user per minute",
-            "# TYPE hosting_rate_limit_per_minute gauge",
-            f"hosting_rate_limit_per_minute {config.RATE_LIMIT_MSGS_PER_MINUTE}",
-        ]
-        body = "\n".join(lines).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        def metric(name: str, help_text: str, value) -> list[str]:
+            return [f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name} {value}", ""]
+
+        lines: list[str] = []
+        lines += metric("hosting_total_users", "Total registered users", stats["total_users"])
+        lines += metric("hosting_total_bots", "Total bots", stats["total_bots"])
+        lines += metric("hosting_running_bots", "Currently running bots", stats["running"])
+        lines += metric("hosting_crashed_bots", "Crashed bots", stats["crashed"])
+        lines += metric("hosting_total_cpu_percent", "Total CPU usage across all bots", f"{total_cpu:.2f}")
+        lines += metric("hosting_total_memory_mb", "Total memory usage across all bots (MB)", f"{total_mem_mb:.2f}")
+        lines += metric("hosting_host_memory_used_percent", "Host memory used percent", f"{host_mem.percent:.1f}")
+        lines += metric("hosting_data_disk_free_mb", "Free space on the data volume (MB)", f"{disk_free_mb:.0f}")
+        lines += metric("hosting_data_disk_total_mb", "Size of the data volume (MB)", f"{disk_total_mb:.0f}")
+        lines += metric("hosting_watchdog_age_seconds", "Seconds since the last watchdog beat", f"{time.time() - mgr.last_watchdog_beat:.1f}")
+        lines += metric("hosting_uptime_seconds", "Service uptime in seconds", round(time.time() - STARTED_AT, 2))
+        self._respond(200, "\n".join(lines).encode("utf-8"), "text/plain; version=0.0.4; charset=utf-8")
 
     def log_message(self, format, *args):
         return
@@ -1224,10 +1361,19 @@ def run_health_server() -> None:
 async def initialize(application: Application) -> None:
     global MANAGER
     db.init_db()
-    MANAGER = ProcessManager()
+    loop = asyncio.get_running_loop()
+
+    def notify_owner(user_id: int, text: str) -> None:
+        """يُستدعى من خيوط الحارس: يجدول إرسال الرسالة على حلقة asyncio الرئيسية."""
+        future = asyncio.run_coroutine_threadsafe(application.bot.send_message(user_id, text), loop)
+        future.add_done_callback(lambda f: f.exception() and logger.warning("Notify %s failed: %s", user_id, f.exception()))
+
+    if MANAGER is None:
+        MANAGER = ProcessManager()
+    MANAGER.notifier = notify_owner
     Thread(target=run_health_server, daemon=True).start()
-    Thread(target=manager().watchdog_loop, args=(config.WATCHDOG_INTERVAL,), daemon=True).start()
-    # Start automatic backup scheduler
+    # استرداد البوتات التي كانت تعمل قبل إعادة النشر ثم الحارس التلقائي
+    Thread(target=MANAGER.run_background, args=(config.WATCHDOG_INTERVAL,), daemon=True, name="watchdog").start()
     backup_interval = int(os.getenv("BACKUP_INTERVAL_SECONDS", str(backup.BACKUP_INTERVAL_SECONDS)))
     Thread(target=backup.start_backup_scheduler, args=(backup_interval,), daemon=True).start()
     application.bot_data["initialized_at"] = time.time()
@@ -1235,11 +1381,15 @@ async def initialize(application: Application) -> None:
 
 async def shutdown(application: Application) -> None:
     if MANAGER:
-        MANAGER.shutdown_all()
+        # إيقاف البوتات قد يستغرق ثوانٍ: نُجريه في خيط حتى لا نحجب حلقة asyncio
+        await asyncio.to_thread(MANAGER.shutdown_all)
+    backup.stop_backup_scheduler()
 
 
 def build_application() -> Application:
     application = ApplicationBuilder().token(config.HOST_BOT_TOKEN).post_init(initialize).post_shutdown(shutdown).build()
+    application.add_handler(TypeHandler(Update, maintenance_guard), group=-2)
+    application.add_handler(TypeHandler(Update, rate_limit_guard), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("newbot", new_bot))
@@ -1255,9 +1405,31 @@ def build_application() -> Application:
     return application
 
 
+def preflight() -> None:
+    """فحوصات إقلاع: تفشل بوضوح عند خطأ قاتل وتحذّر عند إعداد خطِر، خاصة على Railway."""
+    if not config.ADMIN_IDS:
+        logger.warning("ADMIN_IDS is empty: nobody can use /admin.")
+    if not os.getenv("ENCRYPTION_KEY", "").strip():
+        logger.warning("ENCRYPTION_KEY is not set; relying on a key stored in the data volume. Set it as a secret variable.")
+    probe = config.DB_PATH.parent / ".write_test"
+    try:
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as exc:
+        raise SystemExit(f"Data directory {config.DB_PATH.parent} is not writable: {exc}")
+    if config.ON_RAILWAY:
+        if not str(config.DB_PATH).startswith("/app/data"):
+            logger.warning("DATABASE_PATH=%s is outside /app/data: data will be lost on redeploy unless a Volume is mounted there.", config.DB_PATH)
+        if not os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
+            logger.warning("No Railway Volume detected: attach one at /app/data or all bots/DB vanish on every deploy.")
+        if os.getenv("RAILWAY_DEPLOYMENT_DRAINING_SECONDS") is None:
+            logger.warning("Set RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15 so bots stop gracefully on redeploy.")
+
+
 def main() -> None:
     if not config.HOST_BOT_TOKEN:
         raise SystemExit("HOST_BOT_TOKEN is required. Set it in the environment before starting the hosting bot.")
+    preflight()
     db.init_db()
     global MANAGER
     MANAGER = ProcessManager()

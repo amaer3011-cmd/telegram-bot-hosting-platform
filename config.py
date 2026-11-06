@@ -27,7 +27,41 @@ CLEANUP_INTERVAL_SECONDS = max(60, int(os.getenv("CLEANUP_INTERVAL_SECONDS", "30
 USAGE_HISTORY_INTERVAL_SECONDS = max(30, int(os.getenv("USAGE_HISTORY_INTERVAL_SECONDS", "300")))
 USAGE_HISTORY_MAX_POINTS = max(1, int(os.getenv("USAGE_HISTORY_MAX_POINTS", "50")))
 HEALTH_CHECK_TIMEOUT_SECONDS = max(1, int(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "6")))
-BOT_TOKEN_ENV_KEY = "BOT_TOKEN"
+BOT_TOKEN_ENV_KEY = os.getenv("BOT_TOKEN_ENV_KEY", "BOT_TOKEN").strip() or "BOT_TOKEN"
+# أقصى حجم لملف واحد يكتبه البوت (يحمي القرص من الامتلاء)
+MAX_BOT_FILE_SIZE_MB = max(16, int(os.getenv("MAX_BOT_FILE_SIZE_MB", "512")))
+# كاش pip مشترك بين كل البوتات: يسرّع التثبيت ويوفر الشبكة والقرص
+PIP_CACHE_DIR = Path(os.getenv("PIP_CACHE_DIR", str(DB_PATH.parent / "pip-cache"))).resolve()
+# فاصل بين تشغيل بوت وآخر عند الإقلاع حتى لا ترتفع الذاكرة/المعالج دفعة واحدة
+BOOT_RECOVERY_STAGGER_SECONDS = max(0, int(os.getenv("BOOT_RECOVERY_STAGGER_SECONDS", "3")))
+# المهلة التي ننتظرها لإيقاف كل البوتات بلطف عند إيقاف المنصة قبل القتل القسري
+SHUTDOWN_GRACE_SECONDS = max(1, int(os.getenv("SHUTDOWN_GRACE_SECONDS", "10")))
+# عزل البوتات: كل بوت يعمل بمستخدم نظام مستقل (UID) فلا يقرأ قاعدة البيانات ولا
+# مفتاح التشفير ولا ملفات بقية البوتات. يتطلب تشغيل المنصة كـroot (auto = مفعّل إن كنا root).
+_isolate_mode = os.getenv("ISOLATE_BOTS", "auto").strip().lower()
+ISOLATION_ACTIVE = (
+    os.name == "posix"
+    and hasattr(os, "geteuid")
+    and os.geteuid() == 0
+    and _isolate_mode not in ("false", "0", "no", "off")
+)
+BOT_UID_BASE = max(1000, int(os.getenv("BOT_UID_BASE", "20000")))
+# أقصى عدد عمليات/خيوط لكل بوت (حماية من fork bomb؛ يعمل فقط مع العزل لأنه حد لكل UID)
+MAX_BOT_PROCESSES = max(16, int(os.getenv("MAX_BOT_PROCESSES", "256")))
+# حصة القرص لكل بوت (الملفات + البيئة الافتراضية)؛ 0 = بلا حد
+MAX_BOT_DISK_MB = max(0, int(os.getenv("MAX_BOT_DISK_MB", "1024")))
+DISK_QUOTA_CHECK_SECONDS = max(60, int(os.getenv("DISK_QUOTA_CHECK_SECONDS", "300")))
+# تنبيه الأدمن عندما تنخفض المساحة الحرة في الـVolume عن هذه النسبة (0 = معطّل)
+DISK_ALERT_FREE_PERCENT = max(0, min(50, int(os.getenv("DISK_ALERT_FREE_PERCENT", "10"))))
+DISK_ALERT_COOLDOWN_SECONDS = max(300, int(os.getenv("DISK_ALERT_COOLDOWN_SECONDS", "21600")))
+ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"))
+# مدة الاحتفاظ بسجل التدقيق بالأيام
+AUDIT_RETENTION_DAYS = max(7, int(os.getenv("AUDIT_RETENTION_DAYS", "90")))
+# متغيرات بيئة المنصة التي يجب ألا تصل أبدًا إلى البوتات المستضافة
+HOST_SECRET_ENV_KEYS = {
+    "HOST_BOT_TOKEN", "ENCRYPTION_KEY", "ADMIN_IDS", "DATABASE_PATH", "BOTS_DIR",
+    "POSTGRES_PASSWORD", "REDIS_PASSWORD", "DASHBOARD_PASSWORD", "DASHBOARD_SECRET",
+}
 RESTART_INTERVAL_CHOICES_HOURS = (0, 6, 12, 24, 48)
 PROTECTED_ENV_KEYS = {
     "PATH",
@@ -72,3 +106,4 @@ AI_MAX_FILE_SIZE_KB = int(os.getenv("AI_MAX_FILE_SIZE_KB", "512"))  # الحد �
 
 BOTS_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+PIP_CACHE_DIR.mkdir(parents=True, exist_ok=True)

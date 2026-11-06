@@ -7,7 +7,17 @@ import subprocess
 import sys
 import zipfile
 
-from config import BOTS_DIR, MAX_EXTRACTED_SIZE_MB, MAX_ZIP_FILE_COUNT, VENV_SETUP_TIMEOUT_SECONDS
+from config import (
+    BOT_UID_BASE,
+    BOTS_DIR,
+    ISOLATION_ACTIVE,
+    MAX_BOT_PROCESSES,
+    MAX_BOT_FILE_SIZE_MB,
+    MAX_EXTRACTED_SIZE_MB,
+    MAX_ZIP_FILE_COUNT,
+    PIP_CACHE_DIR,
+    VENV_SETUP_TIMEOUT_SECONDS,
+)
 
 
 def make_bot_folder(owner_id: int, bot_id: int) -> str:
@@ -100,33 +110,69 @@ def extract_zip(zip_path: str, dest_folder: str):
                     f"حجم الأرشيف بعد فك الضغط يتجاوز الحد المسموح ({MAX_EXTRACTED_SIZE_MB}MB)."
                 )
 
+        written = 0
         for info in infos:
             target = _safe_member_path(dest_folder, info.filename)
             if info.is_dir():
                 os.makedirs(target, exist_ok=True)
                 continue
             os.makedirs(os.path.dirname(target), exist_ok=True)
+            # الحجم المعلن داخل الأرشيف قد يكذب: نعدّ البايتات الفعلية أثناء النسخ
             with z.open(info, "r") as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
+                while True:
+                    chunk = src.read(1024 * 256)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise UnsafeZipError(
+                            f"حجم الأرشيف بعد فك الضغط يتجاوز الحد المسموح ({MAX_EXTRACTED_SIZE_MB}MB)."
+                        )
+                    dst.write(chunk)
 
     os.remove(zip_path)
 
 
+_IGNORED_DIRS = {".venv", "__pycache__", ".git", "node_modules", "__MACOSX"}
+
+
+def flatten_single_root(folder: str) -> str:
+    """أرشيفات GitHub وغيرها غالبًا تحتوي مجلدًا واحدًا في الجذر (repo-main/).
+    نرفع محتواه إلى الجذر حتى يجد ensure_venv ملف requirements.txt ويكون
+    مجلد العمل (cwd) صحيحًا للبوت. يتجاهل __MACOSX والملفات المخفية."""
+    entries = [e for e in os.listdir(folder) if e not in ("__MACOSX", "upload.zip")]
+    if len(entries) != 1:
+        return folder
+    inner = os.path.join(folder, entries[0])
+    if not os.path.isdir(inner) or os.path.islink(inner):
+        return folder
+    for name in os.listdir(inner):
+        shutil.move(os.path.join(inner, name), os.path.join(folder, name))
+    os.rmdir(inner)
+    return folder
+
+
 def find_entry_file(folder: str):
-    """يحاول إيجاد ملف التشغيل الرئيسي للبوت داخل المجلد"""
+    """يحاول إيجاد ملف التشغيل الرئيسي للبوت داخل المجلد.
+    الأولوية للملفات المفضّلة بترتيبها (main قبل bot ثم app...) وللأقرب للجذر."""
     preferred = ["main.py", "bot.py", "app.py", "run.py", "start.py"]
     all_py = []
+    best = None  # (depth, preferred_index, path)
     for root, dirs, files in os.walk(folder):
-        # تجاهل مجلد البيئة الافتراضية إن وجد مسبقًا
-        dirs[:] = [d for d in dirs if d != ".venv"]
+        dirs[:] = [d for d in dirs if d not in _IGNORED_DIRS]
+        depth = os.path.relpath(root, folder).count(os.sep) if root != folder else 0
         for f in files:
-            if f.endswith(".py"):
-                full = os.path.join(root, f)
-                all_py.append(full)
-                if f in preferred:
-                    return full
+            if not f.endswith(".py"):
+                continue
+            full = os.path.join(root, f)
+            all_py.append(full)
+            if f in preferred:
+                key = (depth, preferred.index(f), full)
+                if best is None or key < best:
+                    best = key
+    if best:
+        return best[2]
     # لا يوجد اسم مفضّل: نفرز أبجديًا لضمان اختيار حتمي وقابل لإعادة الإنتاج
-    # بدل الاعتماد على ترتيب os.walk غير المضمون عبر أنظمة الملفات المختلفة
     all_py.sort()
     return all_py[0] if all_py else None
 
@@ -168,20 +214,41 @@ def _file_hash(path: str) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def ensure_venv(folder: str, log_path: str):
+def ensure_venv(folder: str, log_path: str, run_as: dict | None = None):
     """ينشئ بيئة افتراضية خاصة بالبوت ويثبّت المتطلبات إن وُجد requirements.txt.
-    يتخطى إعادة التثبيت إذا لم يتغيّر محتوى requirements.txt منذ آخر تشغيل ناجح."""
+    يتخطى إعادة التثبيت إذا لم يتغيّر محتوى requirements.txt منذ آخر تشغيل ناجح.
+    يستخدم كاش pip مشتركًا بين كل البوتات، ويعيد بناء البيئة إذا كانت تالفة."""
     v = venv_path(folder)
     timeout = VENV_SETUP_TIMEOUT_SECONDS
+    run_as = run_as or {}
+    # أسرار المنصة لا تصل إلى pip (قد ينفّذ setup.py لحزم المستخدم). ومع العزل
+    # يعمل pip بمستخدم البوت نفسه ولا نشارك الكاش بين المستخدمين.
+    pip_env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+                                          "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY") if k in os.environ}
+    pip_env.update(PIP_DISABLE_PIP_VERSION_CHECK="1", HOME=folder)
+    pip_args = ["--disable-pip-version-check"]
+    if ISOLATION_ACTIVE:
+        pip_args.append("--no-cache-dir")
+    else:
+        pip_env["PIP_CACHE_DIR"] = str(PIP_CACHE_DIR)
     with open(log_path, "a", encoding="utf-8") as log:
         try:
+            # بيئة نصف مُنشأة (فشل سابق/إيقاف مفاجئ): نحذفها ونبدأ من جديد
+            if os.path.exists(v) and not os.path.exists(venv_python(folder)):
+                log.write(">>> البيئة الافتراضية تالفة — إعادة إنشائها...\n")
+                shutil.rmtree(v, ignore_errors=True)
+
             if not os.path.exists(v):
                 log.write(">>> إنشاء بيئة افتراضية جديدة...\n")
                 log.flush()
-                subprocess.run(
-                    [sys.executable, "-m", "venv", v],
-                    check=True, stdout=log, stderr=log, timeout=timeout,
-                )
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "venv", v],
+                        check=True, stdout=log, stderr=log, timeout=timeout, env=pip_env, **run_as,
+                    )
+                except Exception:
+                    shutil.rmtree(v, ignore_errors=True)  # لا نترك بيئة نصف مكتملة
+                    raise
 
             py = venv_python(folder)
             req = os.path.join(folder, "requirements.txt")
@@ -201,17 +268,13 @@ def ensure_venv(folder: str, log_path: str):
                 log.write(">>> requirements.txt لم يتغيّر — تخطي إعادة التثبيت.\n")
                 return
 
+            # لا نحدّث pip في كل مرة (يستهلك شبكة ووقتًا بلا فائدة)؛ pip الذي يأتي
+            # مع بايثون كافٍ، وكاش pip المشترك يجعل التثبيت المتكرر شبه فوري.
             log.write(">>> تثبيت المتطلبات من requirements.txt ...\n")
             log.flush()
-            pip_upgrade = subprocess.run(
-                [py, "-m", "pip", "install", "--upgrade", "pip"],
-                stdout=log, stderr=log, timeout=timeout,
-            )
-            if pip_upgrade.returncode != 0:
-                raise RuntimeError("فشل تحديث pip داخل بيئة البوت.")
             result = subprocess.run(
-                [py, "-m", "pip", "install", "-r", req],
-                stdout=log, stderr=log, timeout=timeout,
+                [py, "-m", "pip", "install", *pip_args, "-r", req],
+                stdout=log, stderr=log, timeout=timeout, env=pip_env, cwd=folder, **run_as,
             )
             if result.returncode != 0:
                 raise RuntimeError("فشل تثبيت requirements.txt؛ راجع سجل البوت.")
@@ -226,9 +289,13 @@ def tail_file(path: str, n: int = 60) -> str:
     if not os.path.exists(path):
         return "لا يوجد سجل بعد."
     try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-        content = "".join(lines[-n:])
+        # نقرأ آخر 256KB فقط بدل تحميل سجل بحجم عشرات الميغابايت في الذاكرة
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            data = f.read().decode("utf-8", errors="ignore")
+        content = "".join(data.splitlines(keepends=True)[-n:])
         return content or "السجل فارغ."
     except Exception as e:
         return f"تعذر قراءة السجل: {e}"
@@ -346,8 +413,14 @@ def export_bot_zip(folder: str, dest_zip_path_no_ext: str) -> str:
 
 
 def make_resource_limiter(max_memory_mb: int, max_cpu_seconds: int):
-    """يرجع دالة preexec_fn لتمريرها إلى subprocess.Popen لتقييد ذاكرة/معالج
-    العملية الفرعية (تعمل على Linux فقط عبر وحدة resource)."""
+    """يرجع دالة preexec_fn لتمريرها إلى subprocess.Popen لتقييد موارد العملية
+    الفرعية (Linux فقط).
+
+    - RLIMIT_AS سقف أمان واسع (3× حد الذاكرة): الحد الفعلي للذاكرة يُفرض على
+      RSS من الحارس (watchdog)، لأن تقييد الذاكرة الافتراضية بالحد نفسه يكسر
+      مكتبات كثيرة (numpy وaiohttp وخيوط متعددة) رغم أن استهلاكها الحقيقي صغير.
+    - RLIMIT_FSIZE يمنع ملفًا واحدًا من ملء القرص.
+    - RLIMIT_CPU إجمالي وقت المعالج."""
     if os.name == "nt":
         return None
     try:
@@ -356,12 +429,120 @@ def make_resource_limiter(max_memory_mb: int, max_cpu_seconds: int):
         return None
 
     def _limit():
-        try:
-            mem_bytes = max_memory_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-            resource.setrlimit(resource.RLIMIT_CPU, (max_cpu_seconds, max_cpu_seconds))
-        except Exception:
-            # إن فشل ضبط الحد (صلاحيات مثلاً)، نكمل بدون تقييد بدل تعطيل التشغيل بالكامل
-            pass
+        def _set(which, value):
+            try:
+                resource.setrlimit(which, (value, value))
+            except Exception:
+                # إن فشل ضبط حد (صلاحيات مثلاً) نكمل بدل تعطيل التشغيل بالكامل
+                pass
+
+        _set(resource.RLIMIT_AS, max_memory_mb * 3 * 1024 * 1024)
+        _set(resource.RLIMIT_CPU, max_cpu_seconds)
+        _set(resource.RLIMIT_FSIZE, MAX_BOT_FILE_SIZE_MB * 1024 * 1024)
+        if ISOLATION_ACTIVE:  # RLIMIT_NPROC لكل UID: آمن فقط عندما يكون لكل بوت UID خاص
+            _set(resource.RLIMIT_NPROC, MAX_BOT_PROCESSES)
 
     return _limit
+
+
+def sparkline(values, top=None) -> str:
+    """رسم نصي مصغّر للاتجاه (▁▂▃▄▅▆▇█). top = القيمة التي تمثل الارتفاع الأقصى
+    (مثل حد الذاكرة)، وإلا يُستخدم أكبر قيمة في السلسلة."""
+    blocks = "▁▂▃▄▅▆▇█"
+    vals = [float(v or 0) for v in values][-30:]
+    if not vals:
+        return ""
+    peak = float(top) if top else max(vals)
+    if peak <= 0:
+        return blocks[0] * len(vals)
+    return "".join(blocks[min(len(blocks) - 1, int(max(v, 0) / peak * (len(blocks) - 1) + 0.5))] for v in vals)
+
+
+# ---------------- عزل البوتات (UID لكل بوت) ----------------
+
+def bot_uid(bot_id) -> int:
+    return BOT_UID_BASE + int(bot_id)
+
+
+def run_as_kwargs(bot_id) -> dict:
+    """وسائط subprocess لتشغيل أمر بمستخدم البوت (فارغة إن كان العزل غير مفعّل)."""
+    if not ISOLATION_ACTIVE:
+        return {}
+    uid = bot_uid(bot_id)
+    return {"user": uid, "group": uid, "extra_groups": []}
+
+
+def _chown_tree(path: str, uid: int) -> None:
+    os.chown(path, uid, uid, follow_symlinks=False)
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(root, name), uid, uid, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+
+
+def prepare_bot_dir(folder: str, bot_id) -> None:
+    """يجهّز مجلد البوت للعزل: مالكه UID البوت وصلاحياته 700، والمجلدات الأب قابلة
+    للعبور (711) دون سرد محتوياتها. يعيد chown -R فقط إذا تغيّر المالك (بعد رفع/تحديث)."""
+    os.makedirs(os.path.join(folder, ".tmp"), exist_ok=True)
+    if not ISOLATION_ACTIVE:
+        return
+    uid = bot_uid(bot_id)
+    if os.stat(folder).st_uid != uid:
+        _chown_tree(folder, uid)
+    os.chmod(folder, 0o700)
+    os.chown(os.path.join(folder, ".tmp"), uid, uid)
+    parent = os.path.dirname(folder)
+    for d in (parent, str(BOTS_DIR)):
+        try:
+            os.chmod(d, 0o711)
+        except OSError:
+            pass
+
+
+def dir_size_bytes(path: str) -> int:
+    """حجم المجلد الفعلي (بدون تتبّع الروابط الرمزية)."""
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+_ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def parse_env_text(text: str):
+    """يحلل نص .env متعدد الأسطر. يرجع (pairs, rejected_lines). يتجاهل التعليقات
+    والأسطر الفارغة، ويزيل علامات الاقتباس المحيطة بالقيمة."""
+    pairs, rejected = [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _ENV_LINE.match(line)
+        if not m:
+            rejected.append(line[:40])
+            continue
+        key, value = m.group(1).upper(), m.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        elif " #" in value:  # تعليق في نهاية السطر لقيمة غير مقتبسة
+            value = value.split(" #", 1)[0].rstrip()
+        pairs.append((key, value))
+    return pairs, rejected
